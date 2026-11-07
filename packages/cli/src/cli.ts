@@ -15,8 +15,20 @@ import {
   loadConfig,
   type AirouteConfig,
   type Logger,
+  type SourceFactory,
 } from "@airoute/core";
 import { startGateway } from "@airoute/gateway";
+import { createZaiSourceFactory } from "@airoute/zai";
+
+/**
+ * Type-name → factory wiring. `packages/sources/<name>` packages register
+ * here as they land. Enabled-but-unregistered types are skipped with a
+ * warning instead of failing startup.
+ */
+const SOURCE_FACTORIES: Readonly<Record<string, SourceFactory>> = {
+  zai: createZaiSourceFactory,
+  // "openrouter" plugs in here when packages/sources/openrouter lands.
+};
 
 const USAGE = `airoute ${AIRROUTE_VERSION} — local gateway between CLI agents and free AI sources
 
@@ -129,10 +141,7 @@ async function runServe(options: Map<string, string | boolean>): Promise<void> {
   if (hostOverride !== undefined && hostOverride.length > 0) host = hostOverride;
   const port = numberOption(options, "port", config.server.port);
 
-  // Phase 0 registers no source plugins in the CLI; source packages (mock/zai/
-  // openrouter) plug in here as they land. Enabled-but-unregistered types are
-  // skipped with a warning instead of failing startup.
-  const build = await buildRegistry({ config, factories: {}, logger: logger.child("sources") });
+  const build = await buildRegistry({ config, factories: SOURCE_FACTORIES, logger: logger.child("sources") });
 
   logger.info("starting airoute gateway", {
     version: AIRROUTE_VERSION,
@@ -163,7 +172,7 @@ async function runModels(options: Map<string, string | boolean>): Promise<void> 
   const logger = createLogger({ scope: "airoute" });
   const { config, configPath } = await loadOrExit(options, logger);
 
-  const build = await buildRegistry({ config, factories: {}, logger: logger.child("sources") });
+  const build = await buildRegistry({ config, factories: SOURCE_FACTORIES, logger: logger.child("sources") });
   const specs = await build.registry.models();
 
   if (specs.length === 0) {

@@ -18,7 +18,7 @@ CLI agent (OpenCode) ──▶ airoute: POST /v1/chat/completions ──▶ sour
 | `packages/core` | `@airoute/core` — IR types, OpenAI wire mappers, source registry, router, config loader, logger |
 | `packages/gateway` | `@airoute/gateway` — HTTP server (real SSE streaming) |
 | `packages/cli` | `@airoute/cli` — thin CLI: `serve`, `models` |
-| `packages/sources` | source plugins live here (empty in Phase 0) |
+| `packages/sources` | source plugins + the shared `openai-compat` kit (`zai` landed; `openrouter` reserved) |
 | `e2e/mock-provider` | `@airoute/mock-provider` — deterministic fake OpenAI-compatible provider + mock `Source` |
 | `config/airoute.json` | default config (all sources disabled — Phase 1 agent enables them) |
 | `test/` | vitest suite (no network; mock source is injected in-process) |

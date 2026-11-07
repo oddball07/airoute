@@ -1,0 +1,22 @@
+{
+  "name": "@airoute/zai",
+  "version": "0.1.0",
+  "description": "AIRoute source plugin for Z.AI (Zhipu AI) — OpenAI-compatible kit-backed source.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@airoute/core": "0.1.0",
+    "@airoute/openai-compat": "0.1.0"
+  },
+  "files": [
+    "dist"
+  ]
+}

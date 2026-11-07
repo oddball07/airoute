@@ -4,5 +4,11 @@
     "outDir": "dist",
     "rootDir": "src"
   },
-  "include": ["src"]
+  "include": ["src"],
+  "references": [
+    { "path": "../core" },
+    { "path": "../gateway" },
+    { "path": "../sources/openai-compat" },
+    { "path": "../sources/zai" }
+  ]
 }

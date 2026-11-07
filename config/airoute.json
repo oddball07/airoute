@@ -1,7 +1,7 @@
 {
   "$schema": "./airoute.config.schema.json",
   "server": { "host": "127.0.0.1", "port": 8787 },
-  "sources": { "registry": [ { "type": "mock", "enabled": false }, { "type": "zai", "enabled": false }, { "type": "openrouter", "enabled": false } ] },
+  "sources": { "registry": [ { "type": "mock", "enabled": false }, { "type": "zai", "enabled": true }, { "type": "openrouter", "enabled": false } ] },
   "rank": { "weights": { "uptime": 0.35, "quota": 0.25, "latency": 0.2, "context": 0.1, "capability": 0.1 } },
   "aliases": { "free-best": [], "free-coder": [], "free-fast": [] }
 }
