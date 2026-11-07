@@ -1,11 +1,14 @@
 import { type AddressInfo } from "node:net";
+import http from "node:http";
+import type { ReadableStream } from "node:stream/web";
 import {
   createSourceRegistry,
+  type IRChunk,
   type ModelSpec,
   type Source,
   type SourceRegistry,
 } from "@airoute/core";
-import { startGateway, type GatewayHandle } from "@airoute/gateway";
+import { installShutdownHandlers, startGateway, type GatewayHandle } from "@airoute/gateway";
 import { createMockSource, MOCK_MODEL_ID } from "@airoute/mock-provider";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -305,3 +308,205 @@ function deltaChoice(frame: Extract<SseFrame, { kind: "data" }> | undefined) {
     | { delta: { role?: string; content?: string }; finish_reason: string | null }
     | undefined;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Shutdown-handler wiring (SIGINT / SIGTERM / SIGBREAK)                       */
+/* -------------------------------------------------------------------------- */
+
+function deltaTextOfFrames(frames: SseFrame[]): string {
+  return frames
+    .filter((frame): frame is Extract<SseFrame, { kind: "data" }> => frame.kind === "data")
+    .map(deltaText)
+    .join("");
+}
+
+/**
+ * Whether the runtime would actually let us register `signal` (it throws for
+ * signals the platform does not support). Used only to keep the wiring test
+ * portable; on Windows all three signals register.
+ */
+function signalCanRegister(signal: NodeJS.Signals): boolean {
+  const noop = (): void => {};
+  try {
+    process.on(signal, noop);
+    process.off(signal, noop);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+describe("installShutdownHandlers wiring", () => {
+  it("registers SIGINT/SIGTERM/SIGBREAK (where the platform supports them) and the uninstaller removes them", () => {
+    const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGBREAK"];
+    const before = new Map(signals.map((signal) => [signal, process.listenerCount(signal)]));
+
+    const uninstall = installShutdownHandlers(http.createServer());
+
+    for (const signal of signals) {
+      const baseline = before.get(signal) ?? 0;
+      const expected = signalCanRegister(signal) ? baseline + 1 : baseline;
+      expect(process.listenerCount(signal)).toBe(expected);
+    }
+
+    uninstall();
+    for (const signal of signals) {
+      expect(process.listenerCount(signal)).toBe(before.get(signal) ?? 0);
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Stream idle timeout                                                        */
+/* -------------------------------------------------------------------------- */
+
+const IDLE_TIMEOUT_MS = 250;
+const CHUNK_GAP_MS = 80; // well below the window; each gap must reset the deadline
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** A free one-model spec for a test source, exposing `<sourceId>/slow`. */
+function pacedSpec(sourceId: string): ModelSpec {
+  return {
+    id: `${sourceId}/slow`,
+    sourceId,
+    sourceModelId: "slow",
+    label: `${sourceId} (paced)`,
+    contextWindow: 1024,
+    caps: { tools: false, vision: false, reasoning: false },
+    free: true,
+    aliases: [],
+  };
+}
+
+/**
+ * A source whose SSE stream emits one chunk every CHUNK_GAP_MS (a leading
+ * role chunk, then content chunks). After `chunkCount` chunks it either
+ * finishes cleanly (`behavior: "steady"`) or wedges forever
+ * (`behavior: "stall"`) — the read simply never completes, simulating a
+ * dead upstream.
+ */
+function pacedSource(
+  id: string,
+  behavior: "steady" | "stall",
+  chunkCount: number,
+): Source {
+  return {
+    id,
+    listModels: async () => [pacedSpec(id)],
+    stream: async () => {
+      let sent = 0;
+      return new ReadableStream<IRChunk>({
+        async pull(controller) {
+          await sleep(CHUNK_GAP_MS);
+          if (sent < chunkCount) {
+            controller.enqueue(
+              sent === 0 ? { index: 0, role: "assistant" } : { index: sent, content: "x" },
+            );
+            sent += 1;
+            return;
+          }
+          if (behavior === "steady") {
+            controller.enqueue({ index: sent, finishReason: "stop", done: true });
+            controller.close();
+          }
+          // "stall": never enqueue again — the read hangs until the gateway aborts.
+        },
+      });
+    },
+    probe: async () => ({ ok: true, at: new Date().toISOString() }),
+  };
+}
+
+describe("stream idle timeout", () => {
+  let slowGateway: GatewayHandle | undefined;
+  let slowBase: string;
+
+  beforeAll(async () => {
+    const registry: SourceRegistry = createSourceRegistry();
+    // Total stream duration: 8 chunks + final stop, at 80 ms per chunk ≈ 720 ms.
+    registry.register(pacedSource("mock-slow", "steady", 8));
+    registry.register(pacedSource("mock-stalled", "stall", 0)); // never emits anything
+    registry.register(pacedSource("mock-hang", "stall", 2)); // emits, then wedges
+    slowGateway = await startGateway({
+      registry,
+      installShutdownHandlers: false,
+      port: 0,
+      requestTimeoutMs: IDLE_TIMEOUT_MS,
+    });
+    const address = slowGateway.server.address() as AddressInfo;
+    slowBase = `http://127.0.0.1:${address.port}`;
+  });
+
+  afterAll(async () => {
+    await slowGateway?.stop();
+    slowGateway = undefined;
+  });
+
+  async function postSlowStream(body: Record<string, unknown>): Promise<Response> {
+    return fetch(`${slowBase}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("does NOT kill a long, steadily chunking stream whose total duration exceeds the window", async () => {
+    // Whole-stream deadline semantics (the old bug) would abort at ~250 ms;
+    // the idle deadline keeps resetting as chunks arrive every 80 ms.
+    // Total duration ≈ 9 * 80 = 720 ms > IDLE_TIMEOUT_MS.
+    const response = await postSlowStream({
+      model: "mock-slow/slow",
+      stream: true,
+      messages: [{ role: "user", content: "steady" }],
+    });
+    expect(response.status).toBe(200);
+
+    const frames = await readSseFrames(response);
+    expect(frames.at(-1)).toEqual({ kind: "done" }); // stream ran to completion
+    const data = frames.filter((frame): frame is Extract<SseFrame, { kind: "data" }> => frame.kind === "data");
+    expect(data.some((frame) => frame.value["error"] !== undefined)).toBe(false);
+    // 7 content chunks delivered after the role chunk (chunkCount includes it).
+    expect(deltaTextOfFrames(frames)).toBe("x".repeat(7));
+  });
+
+  it("aborts with 504 when no first chunk ever arrives within the window", async () => {
+    const response = await postSlowStream({
+      model: "mock-stalled/slow",
+      stream: true,
+      messages: [{ role: "user", content: "stall" }],
+    });
+    expect(response.status).toBe(200); // SSE headers went out before the deadline
+
+    const frames = await readSseFrames(response);
+    expect(frames.at(-1)).toEqual({ kind: "done" });
+    const data = frames.filter((frame): frame is Extract<SseFrame, { kind: "data" }> => frame.kind === "data");
+    expect(data).toHaveLength(1);
+    const error = data[0]!.value["error"] as { message?: string; type?: string; code?: string };
+    expect(error.code).toBe("upstream_timeout");
+    expect(error.type).toBe("server_error"); // 504
+    expect(error.message).toContain("idle for more than 250ms");
+  });
+
+  it("aborts with 504 when a stream stalls mid-flight, after the earlier chunks reset the deadline", async () => {
+    const response = await postSlowStream({
+      model: "mock-hang/slow",
+      stream: true,
+      messages: [{ role: "user", content: "hang" }],
+    });
+    expect(response.status).toBe(200);
+
+    const frames = await readSseFrames(response);
+    expect(frames.at(-1)).toEqual({ kind: "done" });
+    const data = frames.filter((frame): frame is Extract<SseFrame, { kind: "data" }> => frame.kind === "data");
+    // Chunks that arrived before the stall were forwarded to the client...
+    expect(data[0]!.value["object"]).toBe("chat.completion.chunk");
+    // ...and the error frame carries the idle-timeout envelope.
+    const errorFrame = data.find((frame) => frame.value["error"] !== undefined);
+    expect(errorFrame).toBeDefined();
+    const error = errorFrame!.value["error"] as { message?: string; code?: string };
+    expect(error.code).toBe("upstream_timeout");
+    expect(error.message).toContain("idle for more than 250ms");
+  });
+});

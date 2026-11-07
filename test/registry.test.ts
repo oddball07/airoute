@@ -1,5 +1,13 @@
-import { createLogger, createSourceRegistry, resolveModel, type Logger, type ModelSpec, type Source } from "@airoute/core";
-import { describe, expect, it } from "vitest";
+import {
+  TtlCatalogCache,
+  createLogger,
+  createSourceRegistry,
+  resolveModel,
+  type Logger,
+  type ModelSpec,
+  type Source,
+} from "@airoute/core";
+import { describe, expect, it, vi } from "vitest";
 
 function modelSpec(id: string, sourceId: string, overrides: Partial<ModelSpec> = {}): ModelSpec {
   const sourceModelId = id.startsWith(`${sourceId}/`) ? id.slice(sourceId.length + 1) : id;
@@ -78,6 +86,133 @@ describe("SourceRegistry", () => {
     expect(registry.get("a")).toBe(source);
     expect(registry.get("missing")).toBeUndefined();
     expect(registry.has("a")).toBe(true);
+  });
+});
+
+describe("SourceRegistry catalog cache", () => {
+  const sleep = (ms: number): Promise<void> =>
+    new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+  it("serves the cached catalog within the TTL and refetches after it expires", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const registry = createSourceRegistry(undefined, { cacheTtlMs: 1_000 });
+      registry.register(
+        stubSource("a", async () => {
+          calls += 1;
+          return [modelSpec(`a/m${calls}`, "a")];
+        }),
+      );
+
+      expect((await registry.models()).map((spec) => spec.id)).toEqual(["a/m1"]);
+      expect((await registry.models()).map((spec) => spec.id)).toEqual(["a/m1"]); // within TTL → cached
+      expect(calls).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(1_001);
+      expect((await registry.models()).map((spec) => spec.id)).toEqual(["a/m2"]);
+      expect(calls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("concurrent models() calls share a single in-flight fetch per source", async () => {
+    let calls = 0;
+    const registry = createSourceRegistry();
+    registry.register(
+      stubSource("a", async () => {
+        calls += 1;
+        await sleep(50);
+        return [modelSpec(`a/m${calls}`, "a")];
+      }),
+    );
+
+    const [first, second] = await Promise.all([registry.models(), registry.models()]);
+    expect(calls).toBe(1);
+    expect(first.map((spec) => spec.id)).toEqual(second.map((spec) => spec.id));
+  });
+
+  it("serves a stale catalog and warns when a refresh fails", async () => {
+    vi.useFakeTimers();
+    try {
+      const { logger, lines } = capturingLogger();
+      let failing = false;
+      const registry = createSourceRegistry(logger, { cacheTtlMs: 500 });
+      registry.register(
+        stubSource("a", async () => {
+          if (failing) throw new Error("catalog service down");
+          return [modelSpec("a/m1", "a")];
+        }),
+      );
+      // Warm the cache.
+      expect((await registry.models()).map((spec) => spec.id)).toEqual(["a/m1"]);
+
+      await vi.advanceTimersByTimeAsync(501);
+      failing = true; // the entry is now expired and the source is down
+      expect((await registry.models()).map((spec) => spec.id)).toEqual(["a/m1"]);
+
+      const warns = lines.filter((line) => line.includes("failed to refresh models"));
+      expect(warns).toHaveLength(1);
+      expect(warns[0]).toContain("source 'a'");
+      expect(warns[0]).toContain("catalog service down");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a cold failure still skips the source (no cached value to fall back on)", async () => {
+    const { logger, lines } = capturingLogger();
+    const registry = createSourceRegistry(logger, { cacheTtlMs: 60_000 });
+    registry.register(
+      stubSource("boom", async () => {
+        throw new Error("cold catalog explosion");
+      }),
+    );
+    registry.register(stubSource("good", async () => [modelSpec("good/m1", "good")]));
+
+    const models = await registry.models();
+    expect(models.map((spec) => spec.id)).toEqual(["good/m1"]);
+
+    const warns = lines.filter((line) => line.includes("failed to list models"));
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toContain("source 'boom'");
+    expect(warns[0]).toContain("cold catalog explosion");
+  });
+
+  it("cacheTtlMs 0 disables caching (every models() call refetches)", async () => {
+    let calls = 0;
+    const registry = createSourceRegistry(undefined, { cacheTtlMs: 0 });
+    registry.register(
+      stubSource("a", async () => {
+        calls += 1;
+        return [modelSpec(`a/m${calls}`, "a")];
+      }),
+    );
+
+    await registry.models();
+    await registry.models();
+    expect(calls).toBe(2);
+  });
+});
+
+describe("TtlCatalogCache", () => {
+  it("round-trips get/put and reports its ttl", () => {
+    const cache = new TtlCatalogCache(5_000);
+    expect(cache.ttlMs).toBe(5_000);
+    expect(cache.get("a")).toBeUndefined();
+
+    cache.put("a", [modelSpec("a/m1", "a")]);
+    const entry = cache.get("a");
+    expect(entry?.value.map((spec) => spec.id)).toEqual(["a/m1"]);
+    expect(typeof entry?.fetchedAtMs).toBe("number");
+    expect(cache.get("missing")).toBeUndefined();
+  });
+
+  it("rejects non-finite or negative ttls", () => {
+    for (const ttl of [-1, NaN, Infinity, "soon"]) {
+      expect(() => new TtlCatalogCache(ttl as number)).toThrow(RangeError);
+    }
   });
 });
 

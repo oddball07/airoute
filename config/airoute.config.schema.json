@@ -37,6 +37,12 @@
             },
             "required": ["type", "enabled"]
           }
+        },
+        "cacheTtlMs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 60000,
+          "description": "Freshness window (ms) for cached per-source model catalogs; 0 disables caching."
         }
       },
       "required": ["registry"]

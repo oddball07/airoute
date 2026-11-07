@@ -20,14 +20,19 @@ import {
   irChunkToOpenAIChunk,
   makeErrorBody,
   openAIRequestToIR,
-  resolveModel,
+  resolveModelFromSpecs,
   type AliasMap,
   type IRChunk,
   type Logger,
+  type ModelSpec,
   type SourceRegistry,
 } from "@airoute/core";
 
-/** Time until an upstream request/stream is aborted. */
+/**
+ * Upstream timeout window. Non-streaming calls treat it as a whole-request
+ * deadline; streaming calls treat it as an idle deadline that resets on every
+ * chunk (including the first one, so it doubles as a first-token deadline).
+ */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 /** Cap on request bodies; larger uploads get 413. */
 export const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024;
@@ -39,7 +44,7 @@ export interface GatewayOptions {
   aliasMap?: AliasMap;
   /** Reported by /healthz; defaults to the core version constant. */
   version?: string;
-  /** Upstream stream/first-token timeout. Default 120 s. */
+  /** Upstream idle timeout for streams (reset per chunk); whole-request deadline for non-stream. Default 120 s. */
   requestTimeoutMs?: number;
   /** Request body size cap in bytes. Default 10 MiB. */
   maxBodyBytes?: number;
@@ -137,10 +142,11 @@ export function installShutdownHandlers(
   options: { logger?: Logger } = {},
 ): () => void {
   const logger = options.logger ?? createLogger({ scope: "airoute:gateway" });
-  const supported: string[] = ["SIGINT", "SIGTERM"];
-  if ("SIGBREAK" in process) {
-    supported.push("SIGBREAK");
-  }
+  // SIGBREAK is the Windows Ctrl+Break/console-close signal. There is no
+  // reliable feature check for it (signal names are not properties of
+  // `process`), so it is registered unconditionally; platforms without it
+  // throw at registration time and the try/catch below then skips it.
+  const supported: string[] = ["SIGINT", "SIGTERM", "SIGBREAK"];
   const handlers: Array<[string, () => void]> = [];
   let shuttingDown = false;
 
@@ -291,11 +297,12 @@ async function chatCompletions(
     return;
   }
 
-  const resolution = await resolveModel(options.registry, irRequest.model, {
+  const specs = await options.registry.models();
+  const resolution = resolveModelFromSpecs(specs, irRequest.model, {
     aliasMap: options.aliasMap,
   });
   if (resolution.kind === "unknown") {
-    sendUnknownModel(response, irRequest.model, options);
+    sendUnknownModel(response, irRequest.model, specs);
     return;
   }
   const spec = resolution.spec;
@@ -361,32 +368,25 @@ async function chatCompletions(
   }
 }
 
+/**
+ * Build the unknown-model 404 from the specs the router already resolved —
+ * no second catalog fetch.
+ */
 function sendUnknownModel(
   response: http.ServerResponse,
   requested: string,
-  options: GatewayOptions,
+  specs: readonly ModelSpec[],
 ): void {
-  void options.registry
-    .models()
-    .then((specs) => {
-      const ids = specs.map((spec) => spec.id);
-      const suggestions = closestModelIds(requested, ids);
-      const hints =
-        suggestions.length > 0 ? ` did you mean: ${suggestions.join(", ")}?` : "";
-      const available = ids.length > 0 ? ` available: ${ids.join(", ")}` : " (no free models are currently enabled)";
-      sendJson(
-        response,
-        404,
-        makeErrorBody(`model "${requested}" not found.${hints}${available}`, 404, "model_not_found"),
-      );
-    })
-    .catch(() => {
-      sendJson(
-        response,
-        404,
-        makeErrorBody(`model "${requested}" not found.`, 404, "model_not_found"),
-      );
-    });
+  const ids = specs.map((spec) => spec.id);
+  const suggestions = closestModelIds(requested, ids);
+  const hints =
+    suggestions.length > 0 ? ` did you mean: ${suggestions.join(", ")}?` : "";
+  const available = ids.length > 0 ? ` available: ${ids.join(", ")}` : " (no free models are currently enabled)";
+  sendJson(
+    response,
+    404,
+    makeErrorBody(`model "${requested}" not found.${hints}${available}`, 404, "model_not_found"),
+  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -400,6 +400,13 @@ const SSE_HEADERS = {
   "x-accel-buffering": "no",
 };
 
+/**
+ * Stream the upstream as real SSE. The upstream timeout is an IDLE deadline:
+ * it is armed once up front — so it doubles as a first-token deadline if no
+ * chunk ever arrives — and reset after every consumed chunk, so a stream that
+ * keeps producing chunks is never killed for taking long. A stream that goes
+ * quiet for the full window is aborted with 504.
+ */
 async function streamCompletion(
   upstream: ReadableStream<IRChunk>,
   response: http.ServerResponse,
@@ -412,16 +419,21 @@ async function streamCompletion(
   response.flushHeaders();
 
   const controller = new AbortController();
-  const timer = setTimeout(
-    () =>
-      controller.abort(
-        new UpstreamError(
-          `upstream did not stream within ${timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS}ms`,
-          { status: 504, code: "upstream_timeout" },
+  const windowMs = timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  let timer: NodeJS.Timeout | undefined;
+  const armIdleTimer = (): void => {
+    timer = setTimeout(
+      () =>
+        controller.abort(
+          new UpstreamError(
+            `upstream stream was idle for more than ${windowMs}ms`,
+            { status: 504, code: "upstream_timeout" },
+          ),
         ),
-      ),
-    timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-  );
+      windowMs,
+    );
+  };
+  armIdleTimer();
 
   let clientClosed = false;
   response.on("close", () => {
@@ -433,6 +445,8 @@ async function streamCompletion(
   let lastIndex = 0;
   try {
     for await (const chunk of upstreamChunks(upstream, controller.signal)) {
+      clearTimeout(timer);
+      armIdleTimer(); // activity resets the idle deadline
       lastIndex = chunk.index;
       if (chunk.finishReason != null) sawFinish = true;
       sendSseEvent(response, irChunkToOpenAIChunk(chunk, wireModel));

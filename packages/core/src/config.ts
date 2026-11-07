@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { ConfigError } from "./errors.js";
+import { DEFAULT_CATALOG_TTL_MS } from "./registry.js";
 
 /* -------------------------------------------------------------------------- */
 /* Types                                                                      */
@@ -28,7 +29,11 @@ export interface RankWeights {
 export interface AirouteConfig {
   $schema?: string;
   server: ServerConfig;
-  sources: { registry: SourceConfigEntry[] };
+  sources: {
+    registry: SourceConfigEntry[];
+    /** Freshness window for cached per-source model catalogs, ms; 0 disables caching. */
+    cacheTtlMs?: number;
+  };
   rank: { weights: RankWeights };
   aliases: Record<string, string[]>;
 }
@@ -76,7 +81,7 @@ export const DEFAULT_RANK_WEIGHTS: RankWeights = {
   context: 0.1,
   capability: 0.1,
 };
-/** Default registry: every source is disabled until a Phase 1 agent enables it. */
+/** Registry entry defaults. `cacheTtlMs` controls catalog caching (0 disables it). */
 export const DEFAULT_SOURCE_ENTRIES: readonly SourceConfigEntry[] = [
   { type: "mock", enabled: false },
   { type: "zai", enabled: false },
@@ -91,7 +96,10 @@ export const DEFAULT_ALIASES: Record<string, string[]> = {
 export function defaultConfig(): AirouteConfig {
   return {
     server: { ...DEFAULT_SERVER },
-    sources: { registry: DEFAULT_SOURCE_ENTRIES.map((entry) => ({ ...entry })) },
+    sources: {
+      registry: DEFAULT_SOURCE_ENTRIES.map((entry) => ({ ...entry })),
+      cacheTtlMs: DEFAULT_CATALOG_TTL_MS,
+    },
     rank: { weights: { ...DEFAULT_RANK_WEIGHTS } },
     aliases: structuredClone(DEFAULT_ALIASES),
   };
@@ -168,12 +176,27 @@ function normalizeConfig(
     fail("server", "must be an object");
   }
 
-  // sources.registry --------------------------------------------------------
+  // sources -------------------------------------------------------------------
   const rawSources = raw["sources"];
   let registry: SourceConfigEntry[];
+  let cacheTtlMs = DEFAULT_CATALOG_TTL_MS;
   if (rawSources === undefined) {
     registry = DEFAULT_SOURCE_ENTRIES.map((entry) => ({ ...entry }));
   } else if (isRecord(rawSources)) {
+    const rawCacheTtl = rawSources["cacheTtlMs"];
+    if (rawCacheTtl !== undefined) {
+      if (
+        typeof rawCacheTtl !== "number" ||
+        !Number.isInteger(rawCacheTtl) ||
+        rawCacheTtl < 0
+      ) {
+        fail(
+          "sources.cacheTtlMs",
+          "must be a non-negative integer (milliseconds; 0 disables catalog caching)",
+        );
+      }
+      cacheTtlMs = rawCacheTtl;
+    }
     const rawRegistry = rawSources["registry"];
     if (rawRegistry === undefined) {
       registry = DEFAULT_SOURCE_ENTRIES.map((entry) => ({ ...entry }));
@@ -252,7 +275,7 @@ function normalizeConfig(
   }
 
   const schemaValue = raw["$schema"];
-  const config: AirouteConfig = { server, sources: { registry }, rank, aliases };
+  const config: AirouteConfig = { server, sources: { registry, cacheTtlMs }, rank, aliases };
   if (typeof schemaValue === "string") config.$schema = schemaValue;
 
   return { config, warnings };

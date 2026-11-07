@@ -21,7 +21,8 @@ export interface ResolveOptions {
 }
 
 /**
- * Resolve a gateway-level model name to a concrete `ModelSpec`.
+ * Resolve a gateway-level model name to a concrete `ModelSpec` against an
+ * already-fetched list of specs (as returned by `SourceRegistry.models()`).
  *
  * 1. `kind: "exact"` — the name matches a `ModelSpec.id`.
  * 2. `kind: "alias"` — the name resolves through a config alias bucket
@@ -31,29 +32,40 @@ export interface ResolveOptions {
  *    multiple live candidates arrives in Phase 2.
  * 3. `kind: "unknown"` — callers must respond 404.
  */
+export function resolveModelFromSpecs(
+  specs: readonly ModelSpec[],
+  name: string,
+  options: ResolveOptions = {},
+): ResolveResult {
+  const requested = name.trim();
+  if (requested.length === 0) return { kind: "unknown" };
+
+  const exact = specs.find((spec) => spec.id === requested);
+  if (exact) return { kind: "exact", spec: exact };
+
+  const bucket = options.aliasMap?.[requested];
+  if (bucket !== undefined) {
+    for (const candidateId of bucket) {
+      const candidate = specs.find((spec) => spec.id === candidateId);
+      if (candidate) return { kind: "alias", spec: candidate };
+    }
+  }
+
+  const declared = specs.find((spec) => spec.aliases.includes(requested));
+  if (declared) return { kind: "alias", spec: declared };
+  return { kind: "unknown" };
+}
+
+/**
+ * Model name resolution against the registry. Fetches the (cached) aggregated
+ * catalog, then applies `resolveModelFromSpecs`.
+ */
 export async function resolveModel(
   registry: SourceRegistry,
   name: string,
   options: ResolveOptions = {},
 ): Promise<ResolveResult> {
-  const requested = name.trim();
-  const specs = await registry.models();
-  if (requested.length > 0) {
-    const exact = specs.find((spec) => spec.id === requested);
-    if (exact) return { kind: "exact", spec: exact };
-
-    const bucket = options.aliasMap?.[requested];
-    if (bucket !== undefined) {
-      for (const candidateId of bucket) {
-        const candidate = specs.find((spec) => spec.id === candidateId);
-        if (candidate) return { kind: "alias", spec: candidate };
-      }
-    }
-
-    const declared = specs.find((spec) => spec.aliases.includes(requested));
-    if (declared) return { kind: "alias", spec: declared };
-  }
-  return { kind: "unknown" };
+  return resolveModelFromSpecs(await registry.models(), name, options);
 }
 
 /**

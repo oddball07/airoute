@@ -9,6 +9,7 @@
  */
 import type { AirouteConfig, SourceConfigEntry } from "./config.js";
 import { envKeyForType } from "./config.js";
+import { DEFAULT_CATALOG_TTL_MS } from "./registry.js";
 import { createLogger, type Logger } from "./log.js";
 import { SourceRegistry } from "./registry.js";
 import type { Source } from "./types.js";
@@ -43,7 +44,9 @@ export async function buildRegistry(options: BuildRegistryOptions): Promise<Regi
   const env = options.env ?? process.env;
   const factories = options.factories ?? {};
 
-  const registry = new SourceRegistry(logger.child("registry"));
+  const registry = new SourceRegistry(logger.child("registry"), {
+    cacheTtlMs: config.sources.cacheTtlMs ?? DEFAULT_CATALOG_TTL_MS,
+  });
   const enabled: string[] = [];
   const disabled: string[] = [];
   const skipped: RegistryBuild["skipped"] = [];

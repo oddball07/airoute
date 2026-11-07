@@ -13,8 +13,8 @@ Currently landed:
 | --- | --- |
 | `openai-compat` | Shared kit for OpenAI-compatible providers (SSE → IR streaming, probe, non-stream `complete()`, offline-testable via fetch injection). See its README for the contract and exported API. |
 | `zai` | Z.AI (Zhipu AI) plugin built on `openai-compat`; wired into the CLI under the `"zai"` type, enabled in `config/airoute.json`, self-skips without `ZAI_API_KEY`. |
+| `openrouter` | OpenRouter free-model plugin built on `openai-compat`; wired into the CLI under the `"openrouter"` type, enabled in `config/airoute.json`, self-skips without `OPENROUTER_API_KEY`. Fetches the live `GET /models` catalog (free filter → sort → `allow`/`disallow` → `maxModels` cap) or uses a static `models` override. |
 
-Still to come: `openrouter` — the type name is already reserved in
-`KNOWN_SOURCE_TYPES` / the config schema / `SOURCE_ENV_KEYS`, and the CLI
-factory map in `packages/cli/src/cli.ts` marks its wiring spot. Build it on
-`openai-compat` the same way `zai` is.
+Next up (Phase 2): the sources gain the health-monitor hooks the ranker will
+consume; config alias candidates are then ranked by `rank.weights` instead of
+tried in declaration order.

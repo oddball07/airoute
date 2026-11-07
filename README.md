@@ -18,9 +18,9 @@ CLI agent (OpenCode) ──▶ airoute: POST /v1/chat/completions ──▶ sour
 | `packages/core` | `@airoute/core` — IR types, OpenAI wire mappers, source registry, router, config loader, logger |
 | `packages/gateway` | `@airoute/gateway` — HTTP server (real SSE streaming) |
 | `packages/cli` | `@airoute/cli` — thin CLI: `serve`, `models` |
-| `packages/sources` | source plugins + the shared `openai-compat` kit (`zai` landed; `openrouter` reserved) |
+| `packages/sources` | source plugins + the shared `openai-compat` kit (`zai` and `openrouter` landed; `mock` lives in `e2e/mock-provider`) |
 | `e2e/mock-provider` | `@airoute/mock-provider` — deterministic fake OpenAI-compatible provider + mock `Source` |
-| `config/airoute.json` | default config (all sources disabled — Phase 1 agent enables them) |
+| `config/airoute.json` | default config (`zai` + `openrouter` enabled; both self-skip without their env key) |
 | `test/` | vitest suite (no network; mock source is injected in-process) |
 
 ## Commands
@@ -54,7 +54,7 @@ editable per-deployment):
 {
   "$schema": "./airoute.config.schema.json",
   "server": { "host": "127.0.0.1", "port": 8787 },
-  "sources": { "registry": [ { "type": "mock", "enabled": false }, { "type": "zai", "enabled": false }, { "type": "openrouter", "enabled": false } ] },
+  "sources": { "registry": [ { "type": "mock", "enabled": false }, { "type": "zai", "enabled": true }, { "type": "openrouter", "enabled": true } ] },
   "rank": { "weights": { "uptime": 0.35, "quota": 0.25, "latency": 0.2, "context": 0.1, "capability": 0.1 } },
   "aliases": { "free-best": [], "free-coder": [], "free-fast": [] }
 }
@@ -64,6 +64,9 @@ editable per-deployment):
   `ConfigError` naming the offending JSON path.
 - An enabled source of an **unknown type** fails config load; a *disabled*
   unknown entry is tolerated with a warning.
+- `sources.cacheTtlMs` (integer ms, default `60000`): how long each source's
+  model catalog stays cached before `registry.models()` refetches it;
+  `0` disables caching.
 - Aliases: `free-best` maps to an ordered candidate list; the first candidate
   that exists is routed (proper ranking by `rank.weights` arrives in Phase 2).
 
@@ -76,16 +79,26 @@ editable per-deployment):
 | `POST /v1/chat/completions` | OpenAI wire in/out; `stream: true` → SSE (`data: {...}` / `data: [DONE]`), flushed per chunk |
 
 **No auth in Phase 0/1** — the gateway binds `127.0.0.1` and is meant for local
-use. 120 s upstream timeout (`AbortController`); HTTP status semantics: `400`
-validation, `404` unknown model (with did-you-mean hints), `403` non-free,
-`429` passthrough, `500/502/504` upstream. An upstream stream that ends without
-a `finishReason` gets a synthesized final `"stop"` chunk plus a warning log.
+use. The 120 s upstream timeout (`AbortController`, `requestTimeoutMs`) is a
+whole-request deadline for non-streaming calls and an **idle** deadline for
+streams: it resets on every consumed chunk, so a long but productive
+generation is never killed; a stream silent for the full window — including
+one that never produced a first token — is aborted with `504`. HTTP status
+semantics: `400` validation, `404` unknown model (with did-you-mean hints),
+`403` non-free, `429` passthrough, `500/502/504` upstream. An upstream stream
+that ends without a `finishReason` gets a synthesized final `"stop"` chunk
+plus a warning log. Per-source model catalogs are cached in the registry for
+`sources.cacheTtlMs` (default 60 s), with single-flight refreshes and
+stale-serve on refresh failure, so requests don't hammer provider catalogs.
 
 ## Phase status
 
 - **Phase 0 (done)** — skeleton, types, registry, router, streaming gateway,
-  mock provider/source, CLI, tests. All sources disabled by default.
-- **Phase 1 (next)** — real sources (`zai`, `openrouter`), enabling them in
-  config, end-to-end run against live providers. See `packages/sources/README.md`
-  for where source packages live.
-- **Phase 2** — alias candidate ranking using `rank.weights`, usage tracking.
+  mock provider/source, CLI, tests.
+- **Phase 1 (done)** — real sources: `zai` and `openrouter` are wired into the
+  CLI factory map and enabled by default in `config/airoute.json`; each
+  self-skips at startup when its env key is missing. End-to-end runs work
+  against live providers. See `packages/sources/README.md` for where source
+  packages live.
+- **Phase 2 (next)** — per-source health monitor, alias candidate ranking
+  using `rank.weights`, and usage tracking.
