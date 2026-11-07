@@ -1,0 +1,19 @@
+{
+  "name": "@airoute/cli",
+  "version": "0.1.0",
+  "description": "AIRoute CLI: `serve` the gateway, `models` list the free catalog.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/cli.js",
+  "types": "./dist/cli.d.ts",
+  "bin": {
+    "airoute": "./dist/cli.js"
+  },
+  "dependencies": {
+    "@airoute/core": "0.1.0",
+    "@airoute/gateway": "0.1.0"
+  },
+  "files": [
+    "dist"
+  ]
+}

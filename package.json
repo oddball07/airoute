@@ -1,0 +1,28 @@
+{
+  "name": "airoute",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AIRoute — a local aggregation gateway between CLI coding agents and free AI provider sources.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.9.0"
+  },
+  "workspaces": [
+    "packages/*",
+    "e2e/*"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsx watch --env-file-if-exists=.env packages/cli/src/cli.ts serve",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "node --env-file-if-exists=.env packages/cli/dist/cli.js serve"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

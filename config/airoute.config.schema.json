@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/airoute/airoute/main/config/airoute.config.schema.json",
+  "title": "AIRoute configuration",
+  "description": "Configuration for the AIRoute local gateway.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host": { "type": "string", "default": "127.0.0.1" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 8787 }
+      },
+      "required": ["host", "port"]
+    },
+    "sources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "registry": {
+          "type": "array",
+          "description": "Ordered list of source plugins. Order matters later for alias candidate ranking.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Entries may carry extra per-source options; unknown-but-disabled types are tolerated with a warning.",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["mock", "zai", "openrouter"],
+                "description": "Source plugin type. Extend this enum as new source packages land."
+              },
+              "enabled": { "type": "boolean", "default": false }
+            },
+            "required": ["type", "enabled"]
+          }
+        }
+      },
+      "required": ["registry"]
+    },
+    "rank": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Weights used by alias candidate ranking (Phase 2).",
+      "properties": {
+        "weights": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "uptime": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.35 },
+            "quota": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.25 },
+            "latency": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.2 },
+            "context": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 },
+            "capability": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 }
+          },
+          "required": ["uptime", "quota", "latency", "context", "capability"]
+        }
+      },
+      "required": ["weights"]
+    },
+    "aliases": {
+      "type": "object",
+      "description": "Gateway-level model aliases, e.g. \"free-best\": [\"zai/glm-4.5-air\", \"openrouter/model-id\"]; the first enabled candidate wins (ranking arrives in Phase 2).",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    }
+  }
+}
