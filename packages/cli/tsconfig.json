@@ -9,6 +9,7 @@
     { "path": "../core" },
     { "path": "../gateway" },
     { "path": "../sources/openai-compat" },
+    { "path": "../sources/openrouter" },
     { "path": "../sources/zai" }
   ]
 }

@@ -4,6 +4,7 @@
     { "path": "packages/core" },
     { "path": "packages/gateway" },
     { "path": "packages/sources/openai-compat" },
+    { "path": "packages/sources/openrouter" },
     { "path": "packages/sources/zai" },
     { "path": "packages/cli" },
     { "path": "e2e/mock-provider" }

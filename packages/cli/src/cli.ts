@@ -18,6 +18,7 @@ import {
   type SourceFactory,
 } from "@airoute/core";
 import { startGateway } from "@airoute/gateway";
+import { createOpenRouterSourceFactory } from "@airoute/openrouter";
 import { createZaiSourceFactory } from "@airoute/zai";
 
 /**
@@ -27,7 +28,7 @@ import { createZaiSourceFactory } from "@airoute/zai";
  */
 const SOURCE_FACTORIES: Readonly<Record<string, SourceFactory>> = {
   zai: createZaiSourceFactory,
-  // "openrouter" plugs in here when packages/sources/openrouter lands.
+  openrouter: createOpenRouterSourceFactory,
 };
 
 const USAGE = `airoute ${AIRROUTE_VERSION} — local gateway between CLI agents and free AI sources
