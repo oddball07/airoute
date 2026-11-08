@@ -1,8 +1,8 @@
 # @airoute/monitor
 
-Health/uptime tracking layer for AIRoute (Phase 2). Three off-line-tested
-parts: a SQLite metrics store, a staggered probe scheduler, and the circuit
-breaker (`HealthTracker`).
+Health/uptime tracking layer for AIRoute (Phase 2): a SQLite metrics store, a
+staggered probe scheduler, the circuit breaker (`HealthTracker`) and the
+free-model ranker (`rankModels`).
 
 ## Quick start
 
@@ -11,8 +11,8 @@ import {
   createInMemoryStore,
   HealthTracker,
   ProbeScheduler,
+  rankModels,
   classifyError,
-  is-like helpers,
 } from "@airoute/monitor";
 
 // In-memory store (tests) or default file-backed data/airoute.db.
@@ -55,8 +55,7 @@ close()                                       // idempotent
 
 `request_events` records PASSIVE signals — `outcome` is one of
 `"ok" | "rate_limited" | "capacity" | "server" | "timeout" | "network" |
-"drop" | "auth"`. The gateway writes these in Phase 2 part 2 via
-`recordRequest`.
+"drop" | "auth"`. The gateway records these via `recordRequest`.
 
 ## 2. classifyError
 
@@ -100,7 +99,7 @@ one call) and firing `onProbe({ sourceId, spec, probe, errorKind?, at })`.
 ## 4. HealthTracker (circuit breaker)
 
 States `healthy → degraded → cooling → down`; isRoutable is true unless
-`cooling`/`down` (degraded stays routable and is rank-penalized in part 2).
+`cooling`/`down` (degraded stays routable and is penalized by the ranker).
 
 - 3 request failures in 10 min (`requestFailureThreshold` /
   `requestFailureWindowMs`, defaults 3/600 000) → degraded.
@@ -127,3 +126,20 @@ snapshot() manualReset(s,m)
 
 Breaker state survives restarts: a new tracker on the same store restores
 `down`/`cooling` rows at construction.
+
+## 5. Ranking
+
+```ts
+scoreModel({ spec, stats?, state?, lastErrorKind? }, weights, { latencyTargetMs?, contextTarget? })
+rankModels(inputs, weights, options?)             // routable first, score desc, id asc
+rankCandidateSpecs(candidates, lookup, weights, options?)
+```
+
+Components (all 0..1): `uptime` (probe success rate, else request success
+rate, else a neutral 0.5), `quota` (1; 0.4 after a capacity/429 failure, 0
+after auth, 0.7 after other failures; capped at 0.6 while degraded; 0 while
+cooling/down), `latency` (inverse p50 against `DEFAULT_LATENCY_TARGET_MS` =
+10 s, neutral 0.5 when unknown), `context` (window / `DEFAULT_CONTEXT_TARGET`
+= 200k), `capability` (tools 0.5, vision 0.25, reasoning 0.25). The final
+score is the weighted mean over `RankWeights` — dividing by the weight total
+keeps alias-specific boosted profiles (`free-coder`, `free-fast`) safe.

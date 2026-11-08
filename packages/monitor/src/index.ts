@@ -31,6 +31,17 @@ export {
 } from "./kinds.js";
 export { realClock, type TickerClock, type TimeoutLike } from "./clock.js";
 export {
+  DEFAULT_CONTEXT_TARGET,
+  DEFAULT_LATENCY_TARGET_MS,
+  rankCandidateSpecs,
+  rankModels,
+  scoreModel,
+  type ModelScore,
+  type RankInput,
+  type RankOptions,
+  type ScoreBreakdown,
+} from "./rank.js";
+export {
   DEFAULT_PROBE_TIMEOUT_MS,
   probeOne,
 } from "./probe.js";

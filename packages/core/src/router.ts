@@ -15,9 +15,76 @@ export type ResolveResult =
   | { kind: "alias"; spec: ModelSpec }
   | { kind: "unknown" };
 
+/**
+ * Full candidate resolution (Phase 2): the ordered list the gateway tries.
+ *
+ * - `exact`   — single id match.
+ * - `alias`   — every present candidate of the bucket (or every spec that
+ *   declared the alias), ordered by `rankCandidates` when supplied.
+ * - `unknown` — empty list; callers respond 404.
+ */
+export type CandidateResolution =
+  | { kind: "exact" | "alias"; candidates: ModelSpec[] }
+  | { kind: "unknown"; candidates: [] };
+
 export interface ResolveOptions {
   /** Config-declared alias buckets. When omitted, only source-declared aliases apply. */
   aliasMap?: AliasMap;
+  /**
+   * Reorder alias candidates (e.g. by live health score). Exact matches are
+   * never reordered. The callback receives a copy it may freely sort, plus
+   * the alias name so preference profiles (`free-fast`, `free-coder`) can
+   * adjust their weights.
+   */
+  rankCandidates?: (candidates: readonly ModelSpec[], alias: string) => readonly ModelSpec[];
+}
+
+/**
+ * Resolve a gateway-level model name to its ordered candidate list against an
+ * already-fetched list of specs (as returned by `SourceRegistry.models()`).
+ */
+export function resolveCandidates(
+  specs: readonly ModelSpec[],
+  name: string,
+  options: ResolveOptions = {},
+): CandidateResolution {
+  const requested = name.trim();
+  if (requested.length === 0) return { kind: "unknown", candidates: [] };
+
+  const exact = specs.find((spec) => spec.id === requested);
+  if (exact) return { kind: "exact", candidates: [exact] };
+
+  const bucket = options.aliasMap?.[requested];
+  let candidates: ModelSpec[] = [];
+  if (bucket !== undefined) {
+    const seen = new Set<string>();
+    for (const candidateId of bucket) {
+      const candidate = specs.find((spec) => spec.id === candidateId);
+      if (candidate !== undefined && !seen.has(candidate.id)) {
+        seen.add(candidate.id);
+        candidates.push(candidate);
+      }
+    }
+  }
+  if (candidates.length === 0) {
+    candidates = specs.filter((spec) => spec.aliases.includes(requested));
+  }
+  // A declared-but-empty bucket (the shipped defaults for free-best /
+  // free-coder / free-fast) falls back to the whole catalog, so those aliases
+  // work out of the box; ranking then picks the best candidate.
+  if (
+    candidates.length === 0 &&
+    bucket !== undefined &&
+    options.rankCandidates !== undefined
+  ) {
+    candidates = [...specs];
+  }
+  if (candidates.length === 0) return { kind: "unknown", candidates: [] };
+
+  if (candidates.length > 1 && options.rankCandidates !== undefined) {
+    candidates = [...options.rankCandidates([...candidates], requested)];
+  }
+  return { kind: "alias", candidates };
 }
 
 /**
@@ -26,34 +93,26 @@ export interface ResolveOptions {
  *
  * 1. `kind: "exact"` — the name matches a `ModelSpec.id`.
  * 2. `kind: "alias"` — the name resolves through a config alias bucket
- *    (first *present* candidate wins, i.e. all candidates come from enabled
- *    sources since the registry only knows enabled models) or through an
- *    alias a source declared on its own `ModelSpec.aliases`. Ranking across
- *    multiple live candidates arrives in Phase 2.
+ *    (highest-ranked *present* candidate wins, i.e. all candidates come from
+ *    enabled sources since the registry only knows enabled models) or through
+ *    an alias a source declared on its own `ModelSpec.aliases`.
  * 3. `kind: "unknown"` — callers must respond 404.
+ *
+ * This is the single-pick convenience over {@link resolveCandidates}.
  */
 export function resolveModelFromSpecs(
   specs: readonly ModelSpec[],
   name: string,
   options: ResolveOptions = {},
 ): ResolveResult {
-  const requested = name.trim();
-  if (requested.length === 0) return { kind: "unknown" };
-
-  const exact = specs.find((spec) => spec.id === requested);
-  if (exact) return { kind: "exact", spec: exact };
-
-  const bucket = options.aliasMap?.[requested];
-  if (bucket !== undefined) {
-    for (const candidateId of bucket) {
-      const candidate = specs.find((spec) => spec.id === candidateId);
-      if (candidate) return { kind: "alias", spec: candidate };
-    }
+  const resolution = resolveCandidates(specs, name, options);
+  if (resolution.kind === "unknown" || resolution.candidates.length === 0) {
+    return { kind: "unknown" };
   }
-
-  const declared = specs.find((spec) => spec.aliases.includes(requested));
-  if (declared) return { kind: "alias", spec: declared };
-  return { kind: "unknown" };
+  const first = resolution.candidates[0] as ModelSpec;
+  return resolution.kind === "exact"
+    ? { kind: "exact", spec: first }
+    : { kind: "alias", spec: first };
 }
 
 /**

@@ -13,7 +13,8 @@
     }
   },
   "dependencies": {
-    "@airoute/core": "0.1.0"
+    "@airoute/core": "0.1.0",
+    "@airoute/monitor": "0.1.0"
   },
   "files": [
     "dist"

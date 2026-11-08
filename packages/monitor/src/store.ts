@@ -133,7 +133,7 @@ export interface StatsSnapshot {
   ttftP95Ms: number | null;
   /** ISO string of the newest success (probe ok or request "ok"), or null. */
   lastSuccessAt: string | null;
-  /** ISO string of the newest failure (probe !ok or request outcome != "ok"), or null. */
+  /** ISO string of the newest failure (probe !ok or request outcome != "ok"/"drop"), or null. */
   lastFailureAt: string | null;
   /** `error_kind` of the newest failure, falling back to its `outcome`, or null. */
   lastErrorKind: ErrorKind | Outcome | null;
@@ -344,7 +344,7 @@ export class MetricsStore {
       ),
       lastFailureRequest: db.prepare(
         `SELECT ts, COALESCE(error_kind, outcome) AS kind FROM request_events
-         WHERE source_id = ? AND model_id = ? AND outcome != 'ok'
+         WHERE source_id = ? AND model_id = ? AND outcome != 'ok' AND outcome != 'drop'
          ORDER BY ts DESC, id DESC LIMIT 1`,
       ),
     };

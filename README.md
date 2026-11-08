@@ -17,7 +17,8 @@ CLI agent (OpenCode) ──▶ airoute: POST /v1/chat/completions ──▶ sour
 | --- | --- |
 | `packages/core` | `@airoute/core` — IR types, OpenAI wire mappers, source registry, router, config loader, logger |
 | `packages/gateway` | `@airoute/gateway` — HTTP server (real SSE streaming) |
-| `packages/cli` | `@airoute/cli` — thin CLI: `serve`, `models` |
+| `packages/monitor` | `@airoute/monitor` — SQLite metrics store, probe scheduler, circuit breaker, model ranking |
+| `packages/cli` | `@airoute/cli` — thin CLI: `serve`, `models`, `status` |
 | `packages/sources` | source plugins + the shared `openai-compat` kit (`zai` and `openrouter` landed; `mock` lives in `e2e/mock-provider`) |
 | `e2e/mock-provider` | `@airoute/mock-provider` — deterministic fake OpenAI-compatible provider + mock `Source` |
 | `config/airoute.json` | default config (`zai` + `openrouter` enabled; both self-skip without their env key) |
@@ -43,6 +44,7 @@ startup with a `source 'x' disabled: no key` log — never a crash.
 ```bash
 airoute serve [--port N] [--host H] [--config PATH]
 airoute models [--config PATH]   # table: model id, source, context window, aliases
+airoute status [--config PATH]   # ranked free models with breaker state + uptime
 ```
 
 ## Configuration
@@ -67,14 +69,22 @@ editable per-deployment):
 - `sources.cacheTtlMs` (integer ms, default `60000`): how long each source's
   model catalog stays cached before `registry.models()` refetches it;
   `0` disables caching.
-- Aliases: `free-best` maps to an ordered candidate list; the first candidate
-  that exists is routed (proper ranking by `rank.weights` arrives in Phase 2).
+- Aliases: `free-best`, `free-coder` and `free-fast` map to candidate lists.
+  Candidates are ordered by the live ranker (`rank.weights` + health); an
+  **empty** bucket falls back to the whole free catalog, so the shipped
+  defaults work without editing config. `free-coder` boosts capability and
+  `free-fast` boosts latency.
+- `monitor` (optional; all fields defaulted, whole section may be omitted):
+  `enabled` (probes on/off), `probeEveryMs` (default 900000), `jitterMs`
+  (default 60000), `requestFailureWindowMs` (default 600000) and `cooldownMs`
+  (default 300000). The metrics DB path defaults to `data/airoute.db` and can
+  be overridden with the `AIRROUTE_DB` env var.
 
 ## HTTP API (Phase 0/1)
 
 | Endpoint | Notes |
 | --- | --- |
-| `GET /healthz` | `{ ok: true, sources: [{id, modelCount}], version }` |
+| `GET /healthz` | `{ ok: true, sources: [{id, modelCount}], monitor?: { counts, models }, version }` |
 | `GET /v1/models` | aggregated free-model catalog, OpenAI-shaped |
 | `POST /v1/chat/completions` | OpenAI wire in/out; `stream: true` → SSE (`data: {...}` / `data: [DONE]`), flushed per chunk |
 
@@ -91,6 +101,38 @@ plus a warning log. Per-source model catalogs are cached in the registry for
 `sources.cacheTtlMs` (default 60 s), with single-flight refreshes and
 stale-serve on refresh failure, so requests don't hammer provider catalogs.
 
+## Health monitoring and ranking (Phase 2)
+
+`airoute serve` opens the metrics store (`data/airoute.db`, WAL mode, rows older
+than 7 days pruned at boot), restores persisted breaker state and starts one
+probe scheduler per enabled source (unless `monitor.enabled` is false).
+
+- **Active probes** — one timer per source, first fire staggered per source
+  plus random jitter, steady cadence `probeEveryMs + rng * jitterMs`. A tick
+  that fires while the previous cycle still runs is skipped (warn), and a
+  global cap keeps only one probe cycle in flight by default. The model list is
+  fetched once per cycle; on failure the last-good list is used.
+- **Circuit breaker** per `(source, model)` — `healthy -> degraded -> cooling
+  -> down`. Capacity/429 flaps cool down with a doubling backoff (5/10/20/30
+  min, capped); auth/quota failures get a flat 30 min cooldown with no passive
+  recovery; server/network/timeout streaks eventually mark a model `down`.
+  State persists in `model_state`, so routing resumes from the last known
+  health after a restart.
+- **Passive signals** — every routed request records `ok` / `rate_limited` /
+  `capacity` / `server` / `timeout` / `network` / `auth`; client disconnects
+  are a neutral `drop`. Three in-window failures mark a model `degraded`;
+  three passive successes recover it.
+- **Failover** — alias candidates (config buckets and source-declared
+  aliases) are tried in ranked order. A `stream()` that rejects with
+  429/5xx/timeout/network hands the request to the next candidate;
+  client-shape errors (400/404/...) do not. `cooling`/`down` models are
+  skipped entirely. Failover happens before the first chunk; mid-stream
+  failures still surface as an SSE error.
+- **Ranking** (`rank.weights`) — uptime (probe, else request success rate),
+  quota (recent capacity/auth failures), latency (inverse p50), context
+  window and capability flags. `airoute status` prints the ranked table and
+  the best candidate for each alias.
+
 ## Phase status
 
 - **Phase 0 (done)** — skeleton, types, registry, router, streaming gateway,
@@ -100,8 +142,11 @@ stale-serve on refresh failure, so requests don't hammer provider catalogs.
   self-skips at startup when its env key is missing. End-to-end runs work
   against live providers. See `packages/sources/README.md` for where source
   packages live.
-- **Phase 2 (next)** — per-source health monitor, alias candidate ranking
-  using `rank.weights`, and usage tracking.
+- **Phase 2 (done)** — health monitor: SQLite metrics (`data/airoute.db`),
+  probe scheduler, circuit breaker, passive request signals, ranked aliases
+  (`free-best` / `free-coder` / `free-fast`), failover on 429/5xx/timeout,
+  `airoute status` and a `monitor` block in `/healthz`. All offline-tested;
+  live probing verified against ZAI + OpenRouter.
 
 ### Z.AI (zai source)
 

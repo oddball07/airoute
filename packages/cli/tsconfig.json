@@ -8,6 +8,7 @@
   "references": [
     { "path": "../core" },
     { "path": "../gateway" },
+    { "path": "../monitor" },
     { "path": "../sources/openai-compat" },
     { "path": "../sources/openrouter" },
     { "path": "../sources/zai" }

@@ -20,13 +20,22 @@ import {
   irChunkToOpenAIChunk,
   makeErrorBody,
   openAIRequestToIR,
-  resolveModelFromSpecs,
+  resolveCandidates,
   type AliasMap,
   type IRChunk,
   type Logger,
   type ModelSpec,
+  type Source,
   type SourceRegistry,
 } from "@airoute/core";
+import {
+  classifyError,
+  outcomeToErrorKind,
+  type CircuitState,
+  type ErrorKind,
+  type HealthTracker,
+  type Outcome,
+} from "@airoute/monitor";
 
 /**
  * Upstream timeout window. Non-streaming calls treat it as a whole-request
@@ -48,6 +57,16 @@ export interface GatewayOptions {
   requestTimeoutMs?: number;
   /** Request body size cap in bytes. Default 10 MiB. */
   maxBodyBytes?: number;
+  /**
+   * Optional health layer (Phase 2): skips non-routable (cooling/down) models
+   * during failover and records every request outcome passively.
+   */
+  health?: HealthTracker;
+  /**
+   * Optional alias ranker: orders alias candidates (and thereby the failover
+   * order) by live health. Receives the alias name for profile tweaks.
+   */
+  ranker?: (candidates: readonly ModelSpec[], alias: string) => readonly ModelSpec[];
 }
 
 export interface ServeOptions extends GatewayOptions {
@@ -231,8 +250,20 @@ async function healthz(response: http.ServerResponse, options: GatewayOptions): 
   sendJson(response, 200, {
     ok: true,
     sources,
+    ...(options.health !== undefined ? { monitor: monitorSummary(options.health) } : {}),
     version: options.version ?? AIRROUTE_VERSION,
   });
+}
+
+/** Breaker-state summary for `/healthz` (Phase 2 health layer). */
+function monitorSummary(health: HealthTracker): {
+  counts: Record<CircuitState, number>;
+  models: ReturnType<HealthTracker["snapshot"]>;
+} {
+  const counts: Record<CircuitState, number> = { healthy: 0, degraded: 0, cooling: 0, down: 0 };
+  const models = health.snapshot();
+  for (const row of models) counts[row.state] = (counts[row.state] ?? 0) + 1;
+  return { counts, models };
 }
 
 async function listModels(response: http.ServerResponse, options: GatewayOptions): Promise<void> {
@@ -298,22 +329,26 @@ async function chatCompletions(
   }
 
   const specs = await options.registry.models();
-  const resolution = resolveModelFromSpecs(specs, irRequest.model, {
-    aliasMap: options.aliasMap,
+  const resolution = resolveCandidates(specs, irRequest.model, {
+    ...(options.aliasMap !== undefined ? { aliasMap: options.aliasMap } : {}),
+    ...(options.ranker !== undefined ? { rankCandidates: options.ranker } : {}),
   });
   if (resolution.kind === "unknown") {
     sendUnknownModel(response, irRequest.model, specs);
     return;
   }
-  const spec = resolution.spec;
 
-  // Free-only enforcement (runtime check; type system already bans paid specs).
-  if (spec.free !== true) {
+  // Free-only enforcement (runtime check; the type system already bans paid
+  // specs). Aliases may accidentally list a paid id — filter it out; an exact
+  // match on a paid model is a hard 403.
+  const freeCandidates = resolution.candidates.filter((spec) => spec.free === true);
+  if (freeCandidates.length === 0) {
+    const offending = resolution.candidates[0] as ModelSpec;
     sendJson(
       response,
       403,
       makeErrorBody(
-        `model "${spec.id}" is not a free model; AIRoute routes free models only`,
+        `model "${offending.id}" is not a free model; AIRoute routes free models only`,
         403,
         "model_not_free",
       ),
@@ -321,51 +356,154 @@ async function chatCompletions(
     return;
   }
 
-  const source = options.registry.get(spec.sourceId);
-  if (!source) {
+  // Health filter (cooling/down) + source availability, preserving rank order.
+  const candidates: Array<{ spec: ModelSpec; source: Source }> = [];
+  let hiddenByHealth = 0;
+  for (const spec of freeCandidates) {
+    const source = options.registry.get(spec.sourceId);
+    if (source === undefined) continue;
+    if (options.health !== undefined && !options.health.isRoutable(spec.sourceId, spec.id)) {
+      hiddenByHealth += 1;
+      continue;
+    }
+    candidates.push({ spec, source });
+  }
+  if (candidates.length === 0) {
+    const reason =
+      hiddenByHealth > 0
+        ? `every candidate for "${irRequest.model}" is cooling down or down`
+        : `no enabled source backs a candidate for "${irRequest.model}"`;
+    sendJson(response, 503, makeErrorBody(`${reason}; try again later`, 503, "all_candidates_unavailable"));
+    return;
+  }
+
+  // Failover before the first chunk: a source whose `stream()` rejects (429,
+  // 5xx, timeout/network) hands the request to the next-ranked candidate.
+  // Failures after the first chunk are surfaced to the client as before.
+  const attempts: Array<{ model: string; status: number; error: string }> = [];
+  let selected: { spec: ModelSpec; source: Source; upstream: ReadableStream<IRChunk> } | undefined;
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    try {
+      const upstream = await candidate.source.stream({ model: candidate.spec, request: irRequest });
+      selected = { spec: candidate.spec, source: candidate.source, upstream };
+      break;
+    } catch (err) {
+      lastError = err;
+      const retryable = isRetryableUpstreamError(err);
+      if (retryable) {
+        recordRequest(options, candidate.spec, { outcome: outcomeForError(err) });
+      }
+      attempts.push({
+        model: candidate.spec.id,
+        status: err instanceof UpstreamError ? err.status : 502,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      if (!retryable) break;
+    }
+  }
+  if (selected === undefined) {
+    if (attempts.length > 0) {
+      respondUpstreamFailure(response, lastError, logger, "all upstream candidates failed", {
+        requested: irRequest.model,
+        attempts,
+      });
+      return;
+    }
     sendJson(
       response,
       503,
-      makeErrorBody(
-        `source "${spec.sourceId}" backing model "${spec.id}" is not available`,
-        503,
-        "source_unavailable",
-      ),
+      makeErrorBody(`no routable candidate for "${irRequest.model}"; try again later`, 503, "all_candidates_unavailable"),
     );
     return;
   }
 
-  let upstream: ReadableStream<IRChunk>;
-  try {
-    upstream = await source.stream({ model: spec, request: irRequest });
-  } catch (err) {
-    respondUpstreamFailure(response, err, logger, "failed to start upstream stream", {
-      source: source.id,
-      model: spec.id,
-    });
-    return;
-  }
-
-  const aliasResolution = resolution.kind;
+  const { spec, source, upstream } = selected;
   logger.debug("routing chat completion", {
     source: source.id,
     model: spec.id,
     requested: irRequest.model,
-    via: aliasResolution,
+    via: resolution.kind,
+    failedOver: attempts.length > 0,
+    attempts,
     stream: irRequest.stream === true,
   });
 
+  const startedAt = Date.now();
+  const report = (
+    result: { outcome: Outcome; ttftMs?: number; errorKind?: ErrorKind },
+  ): void => {
+    recordRequest(options, spec, { ...result, totalMs: Date.now() - startedAt });
+  };
+  const context = { source: source.id, model: spec.id };
+
   if (irRequest.stream) {
-    await streamCompletion(upstream, response, irRequest.model, options.requestTimeoutMs, logger, {
-      source: source.id,
-      model: spec.id,
-    });
+    await streamCompletion(upstream, response, irRequest.model, options.requestTimeoutMs, logger, context, report);
   } else {
-    await bufferCompletion(upstream, response, irRequest.model, options.requestTimeoutMs, logger, {
-      source: source.id,
-      model: spec.id,
-    });
+    await bufferCompletion(upstream, response, irRequest.model, options.requestTimeoutMs, logger, context, report);
   }
+}
+
+/** Passive outcome recorded for one request (Phase 2 health layer). */
+interface RequestReport {
+  outcome: Outcome;
+  /** First-token latency when the stream produced a chunk. */
+  ttftMs?: number;
+  errorKind?: ErrorKind;
+}
+
+/** Forward a request report to the attached health tracker, if any. */
+function recordRequest(
+  options: GatewayOptions,
+  spec: ModelSpec,
+  report: RequestReport & { totalMs?: number },
+): void {
+  if (options.health === undefined) return;
+  const errorKind =
+    report.errorKind ??
+    (report.outcome === "ok" || report.outcome === "drop"
+      ? undefined
+      : outcomeToErrorKind(report.outcome));
+  options.health.recordRequest({
+    sourceId: spec.sourceId,
+    modelId: spec.id,
+    outcome: report.outcome,
+    ...(report.ttftMs !== undefined ? { ttftMs: report.ttftMs } : {}),
+    ...(report.totalMs !== undefined ? { totalMs: report.totalMs } : {}),
+    ...(errorKind !== undefined ? { errorKind } : {}),
+  });
+}
+
+/**
+ * Classify a thrown upstream error onto the passive `Outcome` vocabulary.
+ * 429s are disambiguated by message: ZAI's "temporarily overloaded" is
+ * capacity, OpenRouter's "Provider returned error" is a server failure.
+ */
+function outcomeForError(err: unknown): Outcome {
+  if (err instanceof UpstreamError) {
+    const status = err.status;
+    if (status === 401 || status === 403 || status === 407) return "auth";
+    if (status === 408 || status === 504) return "timeout";
+    if (status === 429) {
+      const kind = classifyError(err.message);
+      return kind === "unknown" || kind === "rate_limited" ? "rate_limited" : kind;
+    }
+    if (status >= 500) return "server";
+  }
+  const kind = classifyError(err instanceof Error ? err.message : String(err));
+  return kind === "unknown" ? "server" : kind;
+}
+
+/**
+ * Whether trying the next candidate could help. Request-shape failures (400,
+ * 404, 413, 422...) would repeat on every source and are not retried.
+ */
+function isRetryableUpstreamError(err: unknown): boolean {
+  if (!(err instanceof UpstreamError)) return true; // network/unknown: try the next source
+  const status = err.status;
+  if (status === 401 || status === 403 || status === 407) return true; // bad key on THIS source
+  if (status === 408 || status === 429) return true;
+  return status >= 500;
 }
 
 /**
@@ -414,7 +552,9 @@ async function streamCompletion(
   timeoutMs: number | undefined,
   logger: Logger,
   context: { source: string; model: string },
+  onOutcome?: (report: RequestReport) => void,
 ): Promise<void> {
+  const startedAt = Date.now();
   response.writeHead(200, SSE_HEADERS);
   response.flushHeaders();
 
@@ -443,10 +583,12 @@ async function streamCompletion(
 
   let sawFinish = false;
   let lastIndex = 0;
+  let firstChunkAt: number | undefined;
   try {
     for await (const chunk of upstreamChunks(upstream, controller.signal)) {
       clearTimeout(timer);
       armIdleTimer(); // activity resets the idle deadline
+      if (firstChunkAt === undefined) firstChunkAt = Date.now();
       lastIndex = chunk.index;
       if (chunk.finishReason != null) sawFinish = true;
       sendSseEvent(response, irChunkToOpenAIChunk(chunk, wireModel));
@@ -460,14 +602,29 @@ async function streamCompletion(
     }
     response.write("data: [DONE]\n\n");
     response.end();
+    onOutcome?.({
+      outcome: "ok",
+      ...(firstChunkAt !== undefined ? { ttftMs: firstChunkAt - startedAt } : {}),
+    });
     logger.info("streamed completion", context);
   } catch (err) {
-    if (clientClosed || response.writableEnded || response.destroyed) return;
+    if (clientClosed || response.writableEnded || response.destroyed) {
+      onOutcome?.({ outcome: "drop" });
+      return;
+    }
     const body = errorBodyFor(err);
+    const outcome = outcomeForError(err);
+    const errorKind =
+      outcome === "ok" || outcome === "drop" ? undefined : outcomeToErrorKind(outcome);
     logger.warn("upstream stream failed mid-flight", {
       ...context,
       error: body.error.message,
       status: err instanceof UpstreamError ? err.status : 500,
+    });
+    onOutcome?.({
+      outcome,
+      ...(firstChunkAt !== undefined ? { ttftMs: firstChunkAt - startedAt } : {}),
+      ...(errorKind !== undefined ? { errorKind } : {}),
     });
     sendSseEvent(response, { error: body.error });
     response.write("data: [DONE]\n\n");
@@ -484,7 +641,9 @@ async function bufferCompletion(
   timeoutMs: number | undefined,
   logger: Logger,
   context: { source: string; model: string },
+  onOutcome?: (report: RequestReport) => void,
 ): Promise<void> {
+  const startedAt = Date.now();
   const controller = new AbortController();
   const timer = setTimeout(
     () =>
@@ -498,9 +657,11 @@ async function bufferCompletion(
   );
 
   let terminalReason: "stop" | "length" | "tool_calls" = "stop";
+  let firstChunkAt: number | undefined;
   const pieces: string[] = [];
   try {
     for await (const chunk of upstreamChunks(upstream, controller.signal)) {
+      if (firstChunkAt === undefined) firstChunkAt = Date.now();
       if (chunk.content !== undefined) pieces.push(chunk.content);
       // Track the chunk that terminates the stream (it says why: stop/length/tool_calls).
       if (chunk.finishReason != null) terminalReason = chunk.finishReason;
@@ -523,8 +684,20 @@ async function bufferCompletion(
       // Phase 0: sources do not report token usage yet; zeroed placeholders.
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     });
+    onOutcome?.({
+      outcome: "ok",
+      ...(firstChunkAt !== undefined ? { ttftMs: firstChunkAt - startedAt } : {}),
+    });
     logger.info("completed (non-stream)", context);
   } catch (err) {
+    const outcome = outcomeForError(err);
+    const errorKind =
+      outcome === "ok" || outcome === "drop" ? undefined : outcomeToErrorKind(outcome);
+    onOutcome?.({
+      outcome,
+      ...(firstChunkAt !== undefined ? { ttftMs: firstChunkAt - startedAt } : {}),
+      ...(errorKind !== undefined ? { errorKind } : {}),
+    });
     respondUpstreamFailure(response, err, logger, "upstream failed while generating", context);
   } finally {
     clearTimeout(timer);

@@ -107,6 +107,16 @@ describe("MetricsStore — requests", () => {
     expect(stats.ttftP95Ms).toBe(300);
     expect(stats.lastErrorKind).toBe("rate_limited");
   });
+
+  it("does not report a client drop as the last failure", () => {
+    const s = store();
+    const now = Date.now();
+    s.recordRequest({ sourceId: "or", modelId: "or/free", outcome: "drop", totalMs: 50, ts: now });
+    const stats = s.getStats("or", "or/free", 60_000);
+    expect(stats.requests).toBe(1);
+    expect(stats.lastFailureAt).toBeNull();
+    expect(stats.lastErrorKind).toBeNull();
+  });
 });
 
 describe("MetricsStore — breaker state", () => {
