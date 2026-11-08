@@ -13,6 +13,7 @@
     "@airoute/core": "0.1.0",
     "@airoute/gateway": "0.1.0",
     "@airoute/monitor": "0.1.0",
+    "@airoute/opencode": "0.1.0",
     "@airoute/openrouter": "0.1.0",
     "@airoute/zai": "0.1.0"
   },

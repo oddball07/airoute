@@ -18,7 +18,8 @@ CLI agent (OpenCode) ──▶ airoute: POST /v1/chat/completions ──▶ sour
 | `packages/core` | `@airoute/core` — IR types, OpenAI wire mappers, source registry, router, config loader, logger |
 | `packages/gateway` | `@airoute/gateway` — HTTP server (real SSE streaming) |
 | `packages/monitor` | `@airoute/monitor` — SQLite metrics store, probe scheduler, circuit breaker, model ranking |
-| `packages/cli` | `@airoute/cli` — thin CLI: `serve`, `models`, `status` |
+| `packages/cli` | `@airoute/cli` — thin CLI: `serve`, `models`, `status`, `install-opencode` |
+| `packages/opencode` | `@airoute/opencode` — OpenCode V2 custom-provider config builder + installer (JSONC-aware merge, free-only) |
 | `packages/sources` | source plugins + the shared `openai-compat` kit (`zai` and `openrouter` landed; `mock` lives in `e2e/mock-provider`) |
 | `e2e/mock-provider` | `@airoute/mock-provider` — deterministic fake OpenAI-compatible provider + mock `Source` |
 | `config/airoute.json` | default config (`zai` + `openrouter` enabled; both self-skip without their env key) |
@@ -45,6 +46,54 @@ startup with a `source 'x' disabled: no key` log — never a crash.
 airoute serve [--port N] [--host H] [--config PATH]
 airoute models [--config PATH]   # table: model id, source, context window, aliases
 airoute status [--config PATH]   # ranked free models with breaker state + uptime
+
+airoute install-opencode [--project [DIR]] [--config PATH] [--url URL] [--model NAME] [--dry-run]
+# write/merge providers.airoute into an OpenCode config (global by default,
+# <DIR>/opencode.json with --project). Free models only; existing JSONC
+# configs are merged, unrelated keys/providers preserved.
+```
+
+`airoute install-opencode` emits an OpenCode V2 custom provider:
+
+```json
+{
+  "providers": {
+    "airoute": {
+      "name": "AIRoute",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:8787/v1", "apiKey": "airoute" },
+      "models": { "free-best": { "modelID": "free-best", "name": "free-best", ... } }
+    }
+  }
+}
+```
+
+Every free model is selectable as `airoute/<id-or-alias>` (`airoute/free-best`,
+`airoute/zai/glm-4.5-flash`). Model keys may contain `/` but never `#`. The
+installer writes atomically (temp+rename), backs up a changed file to `<path>.bak`,
+and is idempotent: an unchanged install writes nothing. `--url` installs from a
+running (possibly remote) gateway's `/v1/models` instead of the local registry.
+
+## OpenCode quick start
+
+```bash
+npm start                                    # gateway on http://127.0.0.1:8787
+airoute install-opencode --project .         # writes ./opencode.json for this dir
+opencode models                              # airoute/* entries appear
+opencode run --model airoute/free-best "hi"
+```
+
+Use `airoute install-opencode` (no flags) to write the global config
+(`~/.config/opencode/opencode.json`, honoring `XDG_CONFIG_HOME`), or `--url
+http://host:port` to install from an already-running gateway.
+
+Deterministic gate harness (no network, no keys) for failover and
+cooling-model-skip checks:
+
+```bash
+node scripts/opencode-gate-gateway.mjs       # serves on 127.0.0.1:8799
+airoute install-opencode --project <dir> --url http://127.0.0.1:8799
+# (cd <dir>; opencode run --standalone --model airoute/free-failover "Reply with GATE-OK")
 ```
 
 ## Configuration
@@ -85,8 +134,18 @@ editable per-deployment):
 | Endpoint | Notes |
 | --- | --- |
 | `GET /healthz` | `{ ok: true, sources: [{id, modelCount}], monitor?: { counts, models }, version }` |
-| `GET /v1/models` | aggregated free-model catalog, OpenAI-shaped |
+| `GET /v1/models` | aggregated free-model catalog, OpenAI-shaped; a top-level `aliases` array lists alias names |
 | `POST /v1/chat/completions` | OpenAI wire in/out; `stream: true` → SSE (`data: {...}` / `data: [DONE]`), flushed per chunk |
+
+The `/v1/models` `aliases` field is what lets `install-opencode --url` expose a
+remote gateway's aliases without a local config.
+
+**Tool calling** works in both modes: `tools` / `tool_choice` are forwarded
+upstream, streaming responses emit `delta.tool_calls` (arguments concatenated per
+call `index`), and non-streaming responses return
+`choices[0].message.tool_calls` with `finish_reason: "tool_calls"`. Assistant
+`tool_calls` and `tool` role messages round-trip through the IR, so multi-step
+agent loops work.
 
 **No auth in Phase 0/1** — the gateway binds `127.0.0.1` and is meant for local
 use. The 120 s upstream timeout (`AbortController`, `requestTimeoutMs`) is a
@@ -147,6 +206,15 @@ probe scheduler per enabled source (unless `monitor.enabled` is false).
   (`free-best` / `free-coder` / `free-fast`), failover on 429/5xx/timeout,
   `airoute status` and a `monitor` block in `/healthz`. All offline-tested;
   live probing verified against ZAI + OpenRouter.
+- **Phase 3 (done)** — OpenCode integration: `@airoute/opencode` builds and
+  installs the V2 custom provider (`airoute install-opencode`), merging into
+  existing JSONC configs (atomic write, `.bak`, idempotent, dry-run); the
+  catalog can come from a running gateway (`--url`). Tool calling now works
+  end-to-end (IR `toolCalls`, wire `delta.tool_calls`, non-stream
+  `message.tool_calls`). Verified with real OpenCode against live ZAI and a
+  deterministic gate harness (`scripts/opencode-gate-gateway.mjs`): discovery,
+  streaming + multi-turn context, tool calls, failover on a 429 first
+  candidate, and skipping a cooling model. 256 offline tests.
 
 ### Z.AI (zai source)
 

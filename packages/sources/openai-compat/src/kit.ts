@@ -64,6 +64,8 @@ import {
   type ProbeResult,
   type Role,
   type Source,
+  type ToolCall,
+  type ToolCallDelta,
 } from "@airoute/core";
 import { SseTimeoutError, awaitWithTimeout, isPositiveTimeout, readLines } from "./sse.js";
 
@@ -128,6 +130,8 @@ export interface OpenAICompatCompletion {
   content: string;
   finishReason: "stop" | "length" | "tool_calls" | null;
   role: Role;
+  /** Reconstructed tool calls when the upstream produced any. */
+  toolCalls?: ToolCall[];
 }
 
 /**
@@ -522,17 +526,22 @@ export function createOpenAICompatSource(options: OpenAICompatOptions): OpenAICo
     let content = "";
     let finish: OpenAICompatCompletion["finishReason"] = "stop";
     let role: Role | undefined;
+    const toolCalls = new Map<number, { id?: string; name?: string; arguments: string }>();
     const chunks = irChunkStreamFromSse(body, timeoutMs);
     try {
       for await (const chunk of chunks) {
         if (chunk.content !== undefined) content += chunk.content;
         if (chunk.finishReason != null) finish = chunk.finishReason;
         if (role === undefined && chunk.role !== undefined) role = chunk.role;
+        if (chunk.toolCalls !== undefined) accumulateToolCallDeltas(chunk.toolCalls, toolCalls);
       }
     } catch (err) {
       throw wrapReadError(err);
     }
-    return { content, finishReason: finish, role: role ?? "assistant" };
+    const out: OpenAICompatCompletion = { content, finishReason: finish, role: role ?? "assistant" };
+    const reconstructed = reconstructToolCalls(toolCalls);
+    if (reconstructed.length > 0) out.toolCalls = reconstructed;
+    return out;
   }
 
   /* ---- internal fns shared with closures above --------------------------- */
@@ -573,6 +582,43 @@ export function createOpenAICompatSource(options: OpenAICompatOptions): OpenAICo
 
 /* -------------------------------------------------------------------------- */
 /* Pure helpers (module scope)                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Merge streaming tool-call deltas into `calls`, keyed by their `index`:
+ * `id`/`name` are kept from the first delta that carries them, `arguments`
+ * fragments are appended across deltas (split-argument streaming).
+ */
+function accumulateToolCallDeltas(
+  deltas: readonly ToolCallDelta[],
+  calls: Map<number, { id?: string; name?: string; arguments: string }>,
+): void {
+  for (const delta of deltas) {
+    const existing = calls.get(delta.index) ?? { arguments: "" };
+    if (existing.id === undefined && delta.id !== undefined) existing.id = delta.id;
+    if (existing.name === undefined && delta.name !== undefined) existing.name = delta.name;
+    if (delta.arguments !== undefined) existing.arguments += delta.arguments;
+    calls.set(delta.index, existing);
+  }
+}
+
+/**
+ * Reconstruct complete `ToolCall`s from accumulated per-index state, sorted by
+ * index. Deltas without an id or function name are dropped (a call OpenCode
+ * could not act on); missing arguments default to `"{}"`.
+ */
+function reconstructToolCalls(
+  calls: Map<number, { id?: string; name?: string; arguments: string }>,
+): ToolCall[] {
+  return [...calls.entries()]
+    .sort(([a], [b]) => a - b)
+    .flatMap(([, state]) =>
+      state.id !== undefined && state.name !== undefined
+        ? [{ id: state.id, name: state.name, arguments: state.arguments.length > 0 ? state.arguments : "{}" }]
+        : [],
+    );
+}
+
 /* -------------------------------------------------------------------------- */
 
 /** Map one validated `SourceModelDef` onto the gateway `ModelSpec` shape. */
@@ -650,7 +696,36 @@ function completionFromBody(parsed: unknown): OpenAICompatCompletion {
   const rawFinish = first["finish_reason"];
   const finishReason =
     rawFinish === "stop" || rawFinish === "length" || rawFinish === "tool_calls" ? rawFinish : null;
-  return { content, finishReason, role };
+  const out: OpenAICompatCompletion = { content, finishReason, role };
+  const toolCalls = message === undefined ? undefined : parseMessageToolCalls(message);
+  if (toolCalls !== undefined && toolCalls.length > 0) out.toolCalls = toolCalls;
+  return out;
+}
+
+/**
+ * Parse a non-stream assistant `message.tool_calls` array into IR `ToolCall`s.
+ * Tolerant: entries without an id, name or arguments are skipped (arguments
+ * default to `"{}"` when the provider omits them), malformed shapes are
+ * ignored — a missing/empty array yields `undefined`.
+ */
+function parseMessageToolCalls(message: Record<string, unknown>): ToolCall[] | undefined {
+  if (!Array.isArray(message["tool_calls"])) return undefined;
+  const out: ToolCall[] = [];
+  for (const entry of message["tool_calls"]) {
+    if (!isRecord(entry)) continue;
+    const id = entry["id"];
+    const fn = isRecord(entry["function"]) ? entry["function"] : undefined;
+    const name = fn?.["name"];
+    if (typeof id !== "string" || id.length === 0) continue;
+    if (typeof name !== "string" || name.length === 0) continue;
+    const rawArgs = fn?.["arguments"];
+    out.push({
+      id,
+      name,
+      arguments: typeof rawArgs === "string" && rawArgs.length > 0 ? rawArgs : "{}",
+    });
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 /**
@@ -698,13 +773,14 @@ function irChunkStreamFromSse(
       const ir = openAIChunkToIR(wire);
       const hasRole = ir.role !== undefined;
       const hasContent = ir.content !== undefined;
+      const hasToolCalls = ir.toolCalls !== undefined && ir.toolCalls.length > 0;
       const hasFinish = ir.finishReason != null;
       // reasoning_content passthrough is a Phase 2 IR extension; today
       // providers' reasoning-only chunks (e.g. ZAI interleaved chatcmpl ids,
       // OpenRouter free-router reasoning) normalize to empty content deltas:
       // the reasoning text is stripped and the chunk still flows with
       // content-absent shape + correct role/finish bookkeeping.
-      const hasData = hasRole || hasContent || hasFinish || wireCarriesReasoningDelta(wire);
+      const hasData = hasRole || hasContent || hasToolCalls || hasFinish || wireCarriesReasoningDelta(wire);
       if (!hasData) continue; // keep-alive / empty choices
 
       const out: IRChunk = { index: index++ };
@@ -713,6 +789,7 @@ function irChunkStreamFromSse(
         roleSent = true;
       }
       if (hasContent) out.content = ir.content;
+      if (hasToolCalls) out.toolCalls = ir.toolCalls;
       if (hasFinish) {
         out.finishReason = ir.finishReason;
         out.done = true;
@@ -731,9 +808,25 @@ function irChunkStreamFromSse(
 /** Turn a small non-streaming completion into a contract-conformant chunk stream. */
 function chunkStreamFromCompletion(completion: OpenAICompatCompletion): ReadableStream<IRChunk> {
   const finish = completion.finishReason ?? "stop";
-  const parts: IRChunk[] = [{ index: 0, role: completion.role }];
-  if (completion.content.length > 0) parts[0]!.content = completion.content;
-  parts.push({ index: 1, finishReason: finish, done: true });
+  const head: IRChunk = { index: 0, role: completion.role };
+  if (completion.content.length > 0) head.content = completion.content;
+  const toolCallChunks: IRChunk[] = (completion.toolCalls ?? []).map((call, i) => ({
+    index: i + 1,
+    toolCalls: [
+      {
+        index: i,
+        id: call.id,
+        name: call.name,
+        arguments: call.arguments,
+      },
+    ],
+  }));
+  const finishIndex = 1 + toolCallChunks.length;
+  const parts: IRChunk[] = [
+    head,
+    ...toolCallChunks,
+    { index: finishIndex, finishReason: finish, done: true },
+  ];
   let i = 0;
   return new ReadableStream<IRChunk>({
     pull(controller) {

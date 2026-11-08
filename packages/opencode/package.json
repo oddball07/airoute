@@ -1,0 +1,21 @@
+{
+  "name": "@airoute/opencode",
+  "version": "0.1.0",
+  "description": "AIRoute OpenCode integration: generate and install the OpenCode provider config for the local gateway.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@airoute/core": "0.1.0"
+  },
+  "files": [
+    "dist"
+  ]
+}

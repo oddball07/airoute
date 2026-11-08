@@ -5,10 +5,13 @@
  *   airoute serve [--port N] [--host H] [--config PATH]
  *   airoute models [--config PATH]
  *   airoute status [--config PATH]
+ *   airoute install-opencode [--project [DIR]] [--config PATH] [--url URL]
+ *                            [--model NAME] [--dry-run]
  *
  * Hand-rolled argv parsing; no dependencies beyond the AIRoute packages.
  */
 import { existsSync } from "node:fs";
+import path from "node:path";
 import {
   AIRROUTE_VERSION,
   ConfigError,
@@ -23,10 +26,12 @@ import {
   type SourceFactory,
 } from "@airoute/core";
 import { startGateway } from "@airoute/gateway";
+import { fetchGatewayCatalog, globalOpencodeConfigPath, installOpencode, projectOpencodeConfigPath } from "@airoute/opencode";
 import { HealthTracker, MetricsStore, rankModels, type RankInput } from "@airoute/monitor";
 import { createOpenRouterSourceFactory } from "@airoute/openrouter";
 import { createZaiSourceFactory } from "@airoute/zai";
 import { RANK_WINDOW_MS, createRanker, metricsDbPath, startMonitor } from "./monitor-runtime.js";
+import { clientConnectableGatewayUrl } from "./gateway-url.js";
 
 /**
  * Type-name → factory wiring. `packages/sources/<name>` packages register
@@ -44,6 +49,9 @@ Usage:
   airoute serve [--port N] [--host H] [--config PATH]   start the gateway
   airoute models [--config PATH]                        list the free catalog
   airoute status [--config PATH]                        rank free models by health
+  airoute install-opencode [--project [DIR]] [--config PATH]
+                            [--url URL] [--model NAME] [--dry-run]
+                                                        write the OpenCode provider config
   airoute help                                          show this help
 
 Env:
@@ -113,6 +121,9 @@ async function main(): Promise<void> {
       return;
     case "status":
       await runStatus(options);
+      return;
+    case "install-opencode":
+      await runInstallOpencode(options);
       return;
     case "help":
     case "--help":
@@ -304,6 +315,93 @@ async function runStatus(options: Map<string, string | boolean>): Promise<void> 
   } finally {
     store?.close();
   }
+}
+
+/**
+ * Phase 3: write the OpenCode custom-provider config for the AIRoute gateway.
+ *
+ *   airoute install-opencode [--project [DIR]] [--config PATH]
+ *                            [--url URL] [--model NAME] [--dry-run]
+ *
+ * `--project` with a value targets `<DIR>/opencode.json`; the bare flag targets
+ * the cwd. Without the flag the global user config is updated. `--url` pulls
+ * the catalog from a running gateway; otherwise the local source registry is
+ * used. Free models only — the install path rejects anything else.
+ */
+async function runInstallOpencode(options: Map<string, string | boolean>): Promise<void> {
+  const logger = createLogger({ scope: "airoute" });
+  const { config } = await loadOrExit(options, logger);
+
+  const project = options.get("project");
+  const target =
+    project === true
+      ? projectOpencodeConfigPath(process.cwd())
+      : typeof project === "string"
+        ? projectOpencodeConfigPath(path.resolve(project))
+        : globalOpencodeConfigPath();
+
+  const url = stringOption(options, "url");
+  let specs: ModelSpec[];
+  let gatewayUrl: string;
+  let gatewayAliases: string[] = [];
+  if (url !== undefined && url.length > 0) {
+    const catalog = await fetchGatewayCatalog(url);
+    specs = catalog.specs;
+    gatewayAliases = catalog.aliases;
+    gatewayUrl = url;
+  } else {
+    // `0.0.0.0`/`::` are bind-anywhere addresses; clients must connect via
+    // loopback. An explicit `--url` (the other branch) is used verbatim.
+    gatewayUrl = clientConnectableGatewayUrl(config.server.host, config.server.port);
+    const build = await buildRegistry({
+      config,
+      factories: SOURCE_FACTORIES,
+      logger: logger.child("sources"),
+    });
+    specs = await build.registry.models();
+  }
+
+  // A remote gateway's own aliases (served by /v1/models) plus the local
+  // config's aliases; dedupe so an install never writes the same model twice.
+  const aliases = [...new Set([...gatewayAliases, ...Object.keys(config.aliases)])];
+  const defaultModel = stringOption(options, "model")?.replace(/^airoute\//, "");
+  const modelArg = defaultModel !== undefined ? { defaultModel } : {};
+  const dryRun = options.get("dry-run") === true;
+
+  const result = await installOpencode({
+    configPath: target,
+    specs,
+    aliases,
+    gatewayUrl,
+    ...modelArg,
+    dryRun,
+  });
+
+  console.log(`target:  ${result.path}`);
+  console.log(
+    result.created
+      ? "action:  create new config"
+      : result.changed
+        ? "action:  update existing config"
+        : "action:  none (already up to date)",
+  );
+  if (result.backupPath !== undefined) console.log(`backup:  ${result.backupPath}`);
+  console.log(`models:  ${result.modelCount} free model(s) exposed as airoute/<id-or-alias>`);
+  console.log(
+    `aliases: ${aliases.length > 0 ? aliases.join(", ") : "(none — set \"aliases\" in the airoute config)"}`,
+  );
+  if (specs.length === 0) {
+    console.log("note:    no free models in the catalog; only aliases were written");
+  }
+  if (dryRun) {
+    console.log("\ndry run — rendered config (nothing written):");
+    console.log(result.content.trimEnd());
+    return;
+  }
+  const model = defaultModel ?? "free-best";
+  console.log(
+    `\nnext steps:\n  opencode models\n  opencode run --model airoute/${model} "hi"`,
+  );
 }
 
 function pad(value: string, width: number): string {

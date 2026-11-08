@@ -7,6 +7,7 @@
     { "path": "packages/sources/openai-compat" },
     { "path": "packages/sources/openrouter" },
     { "path": "packages/sources/zai" },
+    { "path": "packages/opencode" },
     { "path": "packages/cli" },
     { "path": "e2e/mock-provider" }
   ]

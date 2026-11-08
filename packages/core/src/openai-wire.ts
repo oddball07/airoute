@@ -8,7 +8,15 @@
  */
 import { randomUUID } from "node:crypto";
 import { ValidationError } from "./errors.js";
-import type { IRChunk, IRMessage, IRRequest, Role, ToolCall, ToolSpec } from "./types.js";
+import type {
+  IRChunk,
+  IRMessage,
+  IRRequest,
+  Role,
+  ToolCall,
+  ToolCallDelta,
+  ToolSpec,
+} from "./types.js";
 
 /* -------------------------------------------------------------------------- */
 /* Wire types                                                                 */
@@ -20,6 +28,18 @@ export interface OpenAIToolCall {
   id: string;
   type: "function";
   function: { name: string; arguments: string };
+}
+
+/**
+ * One incremental tool-call entry of a streaming `delta.tool_calls` array:
+ * `{ index, id?, type?: "function", function?: { name?, arguments? } }`, where
+ * later deltas for the same `index` carry only the next `arguments` fragment.
+ */
+export interface OpenAIToolCallDelta {
+  index: number;
+  id?: string;
+  type?: "function";
+  function?: { name?: string; arguments?: string };
 }
 
 export interface OpenAIMessage {
@@ -49,7 +69,7 @@ export interface OpenAIChatRequest {
 
 export interface OpenAIChunkChoice {
   index: number;
-  delta: { role?: Role; content?: string };
+  delta: { role?: Role; content?: string; tool_calls?: OpenAIToolCallDelta[] };
   finish_reason: OpenAIFinishReason;
 }
 
@@ -130,6 +150,10 @@ export function irChunkToOpenAIChunk(chunk: IRChunk, model: string): OpenAIChunk
   const delta: OpenAIChunkChoice["delta"] = {};
   if (chunk.role !== undefined) delta.role = chunk.role;
   if (chunk.content !== undefined) delta.content = chunk.content;
+  const toolCalls = chunk.toolCalls?.map(irToolCallDeltaToOpenAI);
+  if (toolCalls !== undefined && toolCalls.length > 0) {
+    delta.tool_calls = toolCalls;
+  }
   return {
     id: nextChunkId(),
     object: "chat.completion.chunk",
@@ -137,12 +161,26 @@ export function irChunkToOpenAIChunk(chunk: IRChunk, model: string): OpenAIChunk
     model,
     choices: [
       {
-        index: chunk.index,
+        // `IRChunk.index` is a chunk sequence counter (used for ordering inside
+        // the gateway). The OpenAI wire field is the *choice* index, which is
+        // always 0 for our single-choice completions.
+        index: 0,
         delta,
         finish_reason: chunk.finishReason ?? null,
       },
     ],
   };
+}
+
+/** Map one IR tool-call delta onto the OpenAI `delta.tool_calls` entry shape. */
+function irToolCallDeltaToOpenAI(delta: ToolCallDelta): OpenAIToolCallDelta {
+  const out: OpenAIToolCallDelta = { index: delta.index, type: "function" };
+  if (delta.id !== undefined) out.id = delta.id;
+  const fn: { name?: string; arguments?: string } = {};
+  if (delta.name !== undefined) fn.name = delta.name;
+  if (delta.arguments !== undefined) fn.arguments = delta.arguments;
+  if (fn.name !== undefined || fn.arguments !== undefined) out.function = fn;
+  return out;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -326,9 +364,9 @@ function openAIToolToIR(value: unknown, index: number): ToolSpec {
  * Parse one OpenAI SSE chunk into an IR chunk.
  *
  * Never throws: an unrecognized payload degrades to `{ index }` so a single
- * malformed line cannot kill a stream. Tool-call deltas are parsed per the
- * `ToolCall` type; Phase 0's text-only IRChunk carries only `finishReason`
- * for tool flows.
+ * malformed line cannot kill a stream. Tool-call deltas are parsed
+ * defensively into IR `toolCalls` (see `parseToolCallDeltas`); malformed
+ * entries are skipped rather than fatal.
  */
 export function openAIChunkToIR(chunk: unknown): IRChunk {
   if (!isRecord(chunk)) return { index: 0 };
@@ -341,11 +379,13 @@ export function openAIChunkToIR(chunk: unknown): IRChunk {
   const delta = first["delta"];
   let role: Role | undefined;
   let content: string | undefined;
+  let toolCalls: ToolCallDelta[] | undefined;
   if (isRecord(delta)) {
     const deltaRole = delta["role"];
     if (typeof deltaRole === "string" && ROLES.includes(deltaRole)) role = deltaRole as Role;
     const deltaContent = delta["content"];
     if (typeof deltaContent === "string" && deltaContent.length > 0) content = deltaContent;
+    toolCalls = parseToolCallDeltas(delta["tool_calls"]);
   }
 
   const rawFinish = first["finish_reason"];
@@ -356,9 +396,43 @@ export function openAIChunkToIR(chunk: unknown): IRChunk {
   const out: IRChunk = { index };
   if (role !== undefined) out.role = role;
   if (content !== undefined) out.content = content;
+  if (toolCalls !== undefined) out.toolCalls = toolCalls;
   out.finishReason = finishReason;
   if (done) out.done = true;
   return out;
+}
+
+/**
+ * Parse a `delta.tool_calls` array into IR tool-call deltas, defensively:
+ * non-object entries and entries with unusable fields are skipped, a missing
+ * `index` falls back to the array position, and a missing `function` object
+ * is tolerated (the delta may carry only `id`). Returns `undefined` when no
+ * delta parses at all, so empty/malformed arrays do not add a `toolCalls`
+ * field to the chunk.
+ */
+function parseToolCallDeltas(raw: unknown): ToolCallDelta[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: ToolCallDelta[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const entry = raw[i];
+    if (!isRecord(entry)) continue;
+    const rawIndex = entry["index"];
+    if (rawIndex !== undefined && (typeof rawIndex !== "number" || !Number.isInteger(rawIndex) || rawIndex < 0)) {
+      continue;
+    }
+    const delta: ToolCallDelta = { index: typeof rawIndex === "number" ? rawIndex : i };
+    const id = entry["id"];
+    if (typeof id === "string" && id.length > 0) delta.id = id;
+    const fn = entry["function"];
+    if (isRecord(fn)) {
+      const name = fn["name"];
+      if (typeof name === "string" && name.length > 0) delta.name = name;
+      const args = fn["arguments"];
+      if (typeof args === "string" && args.length > 0) delta.arguments = args;
+    }
+    out.push(delta);
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 /* -------------------------------------------------------------------------- */

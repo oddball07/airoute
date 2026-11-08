@@ -46,12 +46,33 @@ export interface IRRequest {
 }
 
 /**
+ * One tool-call delta of a streamed response chunk.
+ *
+ * Deltas are keyed by `index`: the first delta for an index carries `id`
+ * (and usually the function `name`), later deltas carry only `arguments`.
+ * Reconstruct a full call by concatenating the `arguments` JSON fragments
+ * per `index` and filling in `id`/`name` from the first-seen delta.
+ */
+export interface ToolCallDelta {
+  index: number;
+  /** Call id; present on the first delta for this index. */
+  id?: string;
+  /** Function name; usually on the first delta. */
+  name?: string;
+  /** Partial JSON argument string; append per `index`. */
+  arguments?: string;
+}
+
+/**
  * A normalized streamed response chunk.
  *
  * Conventions:
  * - The first chunk usually carries `role`.
  * - `content` chunks carry the text delta only (not the accumulated text).
  * - The terminal chunk carries `finishReason` plus `done: true`.
+ * - `toolCalls` carry per-call deltas keyed by `index`; receivers append
+ *   `arguments` fragments across chunks with the same index (see
+ *   {@link ToolCallDelta}).
  */
 export interface IRChunk {
   index: number;
@@ -59,6 +80,8 @@ export interface IRChunk {
   role?: Role;
   /** Text delta. */
   content?: string;
+  /** Incremental tool-call deltas for this chunk (see {@link ToolCallDelta}). */
+  toolCalls?: ToolCallDelta[];
   finishReason?: "stop" | "length" | "tool_calls" | null;
   done?: boolean;
 }

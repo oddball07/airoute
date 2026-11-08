@@ -61,10 +61,12 @@ function wireChunk(opts: {
   role?: string;
   content?: string;
   finish?: string | null;
+  toolCalls?: unknown[];
 }): string {
-  const delta: Record<string, string> = {};
+  const delta: Record<string, unknown> = {};
   if (opts.role !== undefined) delta["role"] = opts.role;
   if (opts.content !== undefined) delta["content"] = opts.content;
+  if (opts.toolCalls !== undefined) delta["tool_calls"] = opts.toolCalls;
   return data({
     id: "c1",
     object: "chat.completion.chunk",
@@ -206,6 +208,66 @@ describe("createOpenAICompatSource — stream (request shape)", () => {
 });
 
 describe("createOpenAICompatSource — stream (SSE → IR)", () => {
+  it("attaches toolCall deltas to IR chunks and keeps role/finish bookkeeping", async () => {
+    const { source } = kit(() =>
+      sse(
+        wireChunk({ role: "assistant" }),
+        wireChunk({
+          content: "",
+          toolCalls: [{ index: 0, id: "call_x", type: "function", function: { name: "get_weather", arguments: "{\"loc" } }],
+        }),
+        wireChunk({
+          toolCalls: [{ index: 0, function: { arguments: "ation\":\"Paris\"}" } }],
+        }),
+        wireChunk({ finish: "tool_calls" }),
+        "data: [DONE]",
+        "",
+      ),
+    );
+    const spec = (await source.listModels())[0]!;
+    const chunks = await readAll(await source.stream({ model: spec, request: probeRequest }));
+
+    expect(chunks[0]).toMatchObject({ index: 0, role: "assistant" });
+    expect(chunks[1]!.toolCalls).toEqual([
+      { index: 0, id: "call_x", name: "get_weather", arguments: "{\"loc" },
+    ]);
+    expect(chunks[2]!.toolCalls).toEqual([{ index: 0, arguments: "ation\":\"Paris\"}" }]);
+    const last = chunks[chunks.length - 1]!;
+    expect(last).toMatchObject({ finishReason: "tool_calls", done: true });
+    chunks.forEach((chunk, i) => expect(chunk.index).toBe(i));
+  });
+
+  it("emits delta.tool_calls when converting a non-stream tool-call completion body to a chunk stream", async () => {
+    const { source } = kit(() =>
+      json({
+        id: "c11",
+        object: "chat.completion",
+        created: 0,
+        model: "m1",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                { id: "call_w", type: "function", function: { name: "get_weather", arguments: "{}" } },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+      }),
+    );
+    const spec = (await source.listModels())[0]!;
+    const chunks = await readAll(await source.stream({ model: spec, request: probeRequest }));
+
+    expect(chunks[0]).toMatchObject({ index: 0, role: "assistant" });
+    expect(chunks[1]!.toolCalls).toEqual([{ index: 0, id: "call_w", name: "get_weather", arguments: "{}" }]);
+    const last = chunks[chunks.length - 1]!;
+    expect(last).toMatchObject({ index: 2, finishReason: "tool_calls", done: true });
+  });
+
   it("maps SSE chunks into ordered IRChunks and terminates with finish+done", async () => {
     const { source } = kit(echoResponder);
     const spec = (await source.listModels())[0]!;
@@ -566,6 +628,111 @@ describe("createOpenAICompatSource — complete()", () => {
     const completion = await source.complete(spec, probeRequest);
     expect(completion.content).toBe("sse answer");
     expect(completion.finishReason).toBe("stop");
+  });
+
+  it("reconstructs ToolCall[] from SSE deltas with split arguments (keyed by index)", async () => {
+    const { source } = kit(() =>
+      sse(
+        wireChunk({ role: "assistant" }),
+        wireChunk({
+          toolCalls: [{ index: 0, id: "call_x", type: "function", function: { name: "get_weather", arguments: "{\"location\":" } }],
+        }),
+        wireChunk({
+          toolCalls: [{ index: 0, function: { arguments: "\"Paris\"}" } }],
+        }),
+        wireChunk({
+          toolCalls: [{ index: 1, id: "call_y", type: "function", function: { name: "get_time", arguments: "{}" } }],
+        }),
+        wireChunk({ finish: "tool_calls" }),
+        "data: [DONE]",
+        "",
+      ),
+    );
+    const spec = (await source.listModels())[0]!;
+    const completion = await source.complete(spec, probeRequest);
+    expect(completion.toolCalls).toEqual([
+      { id: "call_x", name: "get_weather", arguments: "{\"location\":\"Paris\"}" },
+      { id: "call_y", name: "get_time", arguments: "{}" },
+    ]);
+    expect(completion.content).toBe("");
+    expect(completion.finishReason).toBe("tool_calls");
+  });
+
+  it("maps message.tool_calls from a non-stream JSON body into ToolCall[]", async () => {
+    const { source } = kit(() =>
+      json({
+        id: "c9",
+        object: "chat.completion",
+        created: 0,
+        model: "m1",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call_z",
+                  type: "function",
+                  function: { name: "get_weather", arguments: "{\"location\":\"Paris\"}" },
+                },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+      }),
+    );
+    const spec = (await source.listModels())[0]!;
+    const completion = await source.complete(spec, probeRequest);
+    expect(completion.toolCalls).toEqual([
+      { id: "call_z", name: "get_weather", arguments: "{\"location\":\"Paris\"}" },
+    ]);
+  });
+
+  it("tolerates malformed message.tool_calls entries and default arguments", async () => {
+    const { source } = kit(() =>
+      json({
+        id: "c10",
+        object: "chat.completion",
+        created: 0,
+        model: "m1",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "",
+              tool_calls: [
+                "not-an-object",
+                { id: "call_ok", function: { name: "ping" } },
+                { function: { name: "no-id" } },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+      }),
+    );
+    const spec = (await source.listModels())[0]!;
+    const completion = await source.complete(spec, probeRequest);
+    expect(completion.toolCalls).toEqual([{ id: "call_ok", name: "ping", arguments: "{}" }]);
+  });
+
+  it("leaves completions without tool calls unchanged (no toolCalls field)", async () => {
+    const { source } = kit(() =>
+      sse(
+        wireChunk({ role: "assistant" }),
+        wireChunk({ content: "plain" }),
+        wireChunk({ finish: "stop" }),
+        "data: [DONE]",
+        "",
+      ),
+    );
+    const spec = (await source.listModels())[0]!;
+    const completion = await source.complete(spec, probeRequest);
+    expect(completion).toEqual({ content: "plain", finishReason: "stop", role: "assistant" });
   });
 });
 

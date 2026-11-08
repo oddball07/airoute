@@ -268,8 +268,12 @@ function monitorSummary(health: HealthTracker): {
 
 async function listModels(response: http.ServerResponse, options: GatewayOptions): Promise<void> {
   const specs = await options.registry.models();
+  // Alias names are part of the install contract: `airoute install-opencode
+  // --url` writes exactly these selectable `airoute/<alias>` entries.
+  const aliases = Object.keys(options.aliasMap ?? {});
   sendJson(response, 200, {
     object: "list",
+    ...(aliases.length > 0 ? { aliases } : {}),
     data: specs.map((spec) => ({
       id: spec.id,
       object: "model",
@@ -659,16 +663,52 @@ async function bufferCompletion(
   let terminalReason: "stop" | "length" | "tool_calls" = "stop";
   let firstChunkAt: number | undefined;
   const pieces: string[] = [];
+  // Streaming tool calls, keyed by their `index`: id/name are taken from the
+  // first delta that carries them, `arguments` fragments are appended.
+  const toolCalls = new Map<number, { id?: string; name?: string; arguments: string }>();
   try {
     for await (const chunk of upstreamChunks(upstream, controller.signal)) {
       if (firstChunkAt === undefined) firstChunkAt = Date.now();
       if (chunk.content !== undefined) pieces.push(chunk.content);
+      if (chunk.toolCalls !== undefined) {
+        for (const delta of chunk.toolCalls) {
+          const state = toolCalls.get(delta.index) ?? { arguments: "" };
+          if (state.id === undefined && delta.id !== undefined) state.id = delta.id;
+          if (state.name === undefined && delta.name !== undefined) state.name = delta.name;
+          if (delta.arguments !== undefined) state.arguments += delta.arguments;
+          toolCalls.set(delta.index, state);
+        }
+      }
       // Track the chunk that terminates the stream (it says why: stop/length/tool_calls).
       if (chunk.finishReason != null) terminalReason = chunk.finishReason;
     }
     // A stream that ended without a terminal chunk defaults to a clean "stop",
     // same as the SSE path's synthesized final chunk.
     const finishReason = terminalReason;
+    const content = pieces.join("");
+    const reconstructed = [...toolCalls.entries()]
+      .sort(([a], [b]) => a - b)
+      .flatMap(([, state]) =>
+        state.id === undefined || state.name === undefined
+          ? []
+          : [
+              {
+                id: state.id,
+                type: "function" as const,
+                function: { name: state.name, arguments: state.arguments },
+              },
+            ],
+      );
+    const message: { role: "assistant"; content: string | null; tool_calls?: typeof reconstructed } = {
+      role: "assistant",
+      content,
+    };
+    if (reconstructed.length > 0) {
+      message.tool_calls = reconstructed;
+      // OpenAI's shape: a tool-call turn carries no prose, so content nulls
+      // when nothing was generated alongside the calls.
+      message.content = content.length > 0 ? content : null;
+    }
     sendJson(response, 200, {
       id: `chatcmpl-${Date.now().toString(36)}`,
       object: "chat.completion",
@@ -677,7 +717,7 @@ async function bufferCompletion(
       choices: [
         {
           index: 0,
-          message: { role: "assistant" as const, content: pieces.join("") },
+          message,
           finish_reason: finishReason,
         },
       ],
