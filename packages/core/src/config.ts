@@ -26,6 +26,23 @@ export interface RankWeights {
   capability: number;
 }
 
+/**
+ * Optional `monitor` section: health-probe + breaker tuning.
+ * All fields defaulted; the whole section may be omitted.
+ */
+export interface MonitorConfig {
+  /** Master switch: when false, part 2 wiring disables probes entirely. */
+  enabled: boolean;
+  /** Base per-source probe cadence (ms); integer >= 10000. */
+  probeEveryMs: number;
+  /** Max random jitter added to each cadence (ms); integer 0..600000. */
+  jitterMs: number;
+  /** Rolling window (ms) for counting request failures toward degrade. */
+  requestFailureWindowMs: number;
+  /** Base cooldown (ms) for 429/capacity cool-downs (doubles, capped 30 min). */
+  cooldownMs: number;
+}
+
 export interface AirouteConfig {
   $schema?: string;
   server: ServerConfig;
@@ -36,6 +53,7 @@ export interface AirouteConfig {
   };
   rank: { weights: RankWeights };
   aliases: Record<string, string[]>;
+  monitor?: MonitorConfig;
 }
 
 /** Result of `loadConfig`. `fileFound` reports whether the file existed on disk. */
@@ -93,6 +111,15 @@ export const DEFAULT_ALIASES: Record<string, string[]> = {
   "free-fast": [],
 };
 
+/** Monitor section defaults (module-level constants live in @airoute/monitor). */
+export const DEFAULT_MONITOR: MonitorConfig = {
+  enabled: true,
+  probeEveryMs: 900_000,
+  jitterMs: 60_000,
+  requestFailureWindowMs: 600_000,
+  cooldownMs: 300_000,
+};
+
 export function defaultConfig(): AirouteConfig {
   return {
     server: { ...DEFAULT_SERVER },
@@ -102,6 +129,7 @@ export function defaultConfig(): AirouteConfig {
     },
     rank: { weights: { ...DEFAULT_RANK_WEIGHTS } },
     aliases: structuredClone(DEFAULT_ALIASES),
+    monitor: { ...DEFAULT_MONITOR },
   };
 }
 
@@ -274,9 +302,59 @@ function normalizeConfig(
     fail("aliases", "must be an object");
   }
 
+  // monitor ----------------------------------------------------------------
+  const rawMonitor = raw["monitor"];
+  let monitor: MonitorConfig | undefined;
+  if (rawMonitor === undefined) {
+    monitor = undefined; // omitted section → runtime defaults (DEFAULT_MONITOR)
+  } else if (isRecord(rawMonitor)) {
+    const enabled = rawMonitor["enabled"] === undefined ? DEFAULT_MONITOR.enabled : rawMonitor["enabled"];
+    if (typeof enabled !== "boolean") fail("monitor.enabled", "must be a boolean");
+    const probeEveryMs =
+      rawMonitor["probeEveryMs"] === undefined ? DEFAULT_MONITOR.probeEveryMs : rawMonitor["probeEveryMs"];
+    if (typeof probeEveryMs !== "number" || !Number.isInteger(probeEveryMs) || probeEveryMs < 10_000) {
+      fail("monitor.probeEveryMs", "must be an integer >= 10000 (milliseconds)");
+    }
+    const jitterMs = rawMonitor["jitterMs"] === undefined ? DEFAULT_MONITOR.jitterMs : rawMonitor["jitterMs"];
+    if (
+      typeof jitterMs !== "number" ||
+      !Number.isInteger(jitterMs) ||
+      jitterMs < 0 ||
+      jitterMs > 600_000
+    ) {
+      fail("monitor.jitterMs", "must be an integer between 0 and 600000 (milliseconds)");
+    }
+    const requestFailureWindowMs =
+      rawMonitor["requestFailureWindowMs"] === undefined
+        ? DEFAULT_MONITOR.requestFailureWindowMs
+        : rawMonitor["requestFailureWindowMs"];
+    if (
+      typeof requestFailureWindowMs !== "number" ||
+      !Number.isInteger(requestFailureWindowMs) ||
+      requestFailureWindowMs < 1
+    ) {
+      fail("monitor.requestFailureWindowMs", "must be a positive integer (milliseconds)");
+    }
+    const cooldownMs =
+      rawMonitor["cooldownMs"] === undefined ? DEFAULT_MONITOR.cooldownMs : rawMonitor["cooldownMs"];
+    if (typeof cooldownMs !== "number" || !Number.isInteger(cooldownMs) || cooldownMs < 1) {
+      fail("monitor.cooldownMs", "must be a positive integer (milliseconds)");
+    }
+    monitor = {
+      enabled: enabled as boolean,
+      probeEveryMs: probeEveryMs as number,
+      jitterMs: jitterMs as number,
+      requestFailureWindowMs: requestFailureWindowMs as number,
+      cooldownMs: cooldownMs as number,
+    };
+  } else {
+    fail("monitor", "must be an object");
+  }
+
   const schemaValue = raw["$schema"];
   const config: AirouteConfig = { server, sources: { registry, cacheTtlMs }, rank, aliases };
   if (typeof schemaValue === "string") config.$schema = schemaValue;
+  if (monitor !== undefined) config.monitor = monitor;
 
   return { config, warnings };
 }

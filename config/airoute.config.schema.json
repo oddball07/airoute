@@ -74,6 +74,43 @@
         "type": "array",
         "items": { "type": "string" }
       }
+    },
+    "monitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Health monitoring (Phase 2): per-source probe cadence, metrics and circuit-breaker tuning. Omitted fields fall back to their defaults and the whole section may be omitted.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Master switch for the monitor (probe scheduling)."
+        },
+        "probeEveryMs": {
+          "type": "integer",
+          "minimum": 10000,
+          "default": 900000,
+          "description": "Base probe cadence per source (15 min default)."
+        },
+        "jitterMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 600000,
+          "default": 60000,
+          "description": "Max random jitter added to every probe cadence (1 min default)."
+        },
+        "requestFailureWindowMs": {
+          "type": "integer",
+          "minimum": 1000,
+          "default": 600000,
+          "description": "Rolling window (ms) for counting request failures toward a degrade (10 min default)."
+        },
+        "cooldownMs": {
+          "type": "integer",
+          "minimum": 1000,
+          "default": 300000,
+          "description": "Base cooldown (ms) for 429/capacity failures; doubles on consecutive failures, capped at 30 min."
+        }
+      }
     }
   }
 }

@@ -2,6 +2,7 @@
   "files": [],
   "references": [
     { "path": "packages/core" },
+    { "path": "packages/monitor" },
     { "path": "packages/gateway" },
     { "path": "packages/sources/openai-compat" },
     { "path": "packages/sources/openrouter" },

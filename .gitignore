@@ -14,3 +14,6 @@ dist/
 coverage/
 *.log
 .DS_Store
+
+# runtime state (metrics store, WAL files)
+data/

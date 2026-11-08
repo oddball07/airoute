@@ -1,7 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { ConfigError, loadConfig, type LoadConfigOptions } from "@airoute/core";
+import { ConfigError, DEFAULT_MONITOR, loadConfig, type LoadConfigOptions } from "@airoute/core";
 import { afterAll, describe, expect, it } from "vitest";
 
 const KNOWN: LoadConfigOptions["knownTypes"] = ["mock", "zai", "openrouter"];
@@ -118,6 +118,54 @@ describe("loadConfig", () => {
     await expect(loadConfig(file)).rejects.toSatisfy((err: unknown) => {
       expect(err).toBeInstanceOf(ConfigError);
       expect((err as Error).message).toContain('aliases["free-best"]');
+      return true;
+    });
+  });
+});
+
+describe("loadConfig — monitor section", () => {
+  it("leaves monitor undefined when the section is omitted", async () => {
+    const file = await tempFile("no-monitor.json", JSON.stringify({ sources: { registry: [] } }));
+    const loaded = await loadConfig(file);
+    expect(loaded.config.monitor).toBeUndefined();
+  });
+
+  it("fills monitor defaults when the section is present but empty", async () => {
+    const file = await tempFile("empty-monitor.json", JSON.stringify({ monitor: {} }));
+    const loaded = await loadConfig(file);
+    expect(loaded.config.monitor).toEqual(DEFAULT_MONITOR);
+  });
+
+  it("accepts monitor overrides", async () => {
+    const monitor = {
+      enabled: false,
+      probeEveryMs: 60_000,
+      jitterMs: 0,
+      requestFailureWindowMs: 1_000,
+      cooldownMs: 2_000,
+    };
+    const file = await tempFile("monitor-overrides.json", JSON.stringify({ monitor }));
+    const loaded = await loadConfig(file);
+    expect(loaded.config.monitor).toEqual(monitor);
+  });
+
+  it.each([
+    [{ probeEveryMs: 9_999 }, "monitor.probeEveryMs"],
+    [{ probeEveryMs: 1.5 }, "monitor.probeEveryMs"],
+    [{ jitterMs: -1 }, "monitor.jitterMs"],
+    [{ jitterMs: 600_001 }, "monitor.jitterMs"],
+    [{ requestFailureWindowMs: 0 }, "monitor.requestFailureWindowMs"],
+    [{ cooldownMs: 0 }, "monitor.cooldownMs"],
+    [{ enabled: "yes" }, "monitor.enabled"],
+    ["not-an-object", "monitor"],
+  ] as const)("rejects invalid monitor config %j", async (monitor, expectedPath) => {
+    const file = await tempFile(
+      `bad-monitor-${Math.random().toString(36).slice(2)}.json`,
+      JSON.stringify({ monitor }),
+    );
+    await expect(loadConfig(file)).rejects.toSatisfy((err: unknown) => {
+      expect(err).toBeInstanceOf(ConfigError);
+      expect((err as Error).message).toContain(expectedPath);
       return true;
     });
   });
