@@ -3,7 +3,7 @@
 A **local aggregation gateway** between CLI coding agents (OpenCode first) and AI
 provider "sources". Sources are plugins implementing one common TypeScript
 interface; the gateway presents a single OpenAI-compatible endpoint and routes
-requests to the right source model (`zai/glm-4.5-air`, the alias `free-best`, ...).
+requests to the right source model (`zai/glm-4.5-flash`, the alias `free-best`, ...).
 Free models only — paid specs cannot type-check into the catalog and are rejected
 with `403` at runtime if one ever appears.
 
@@ -102,3 +102,44 @@ stale-serve on refresh failure, so requests don't hammer provider catalogs.
   packages live.
 - **Phase 2 (next)** — per-source health monitor, alias candidate ranking
   using `rank.weights`, and usage tracking.
+
+### Z.AI (zai source)
+
+Default models are live-verified with a real key (see `Live smoke` below) and
+carried by the code (`DEFAULT_ZAI_MODELS`) — the shipped config needs no
+`models` override. Two facts worth knowing before you rely on it:
+
+- **Thinking is disabled by default.** `glm-4.5-flash` is a thinking model:
+  with default settings its whole `max_tokens` budget goes to
+  `reasoning_content` and `content` comes back empty. The zai source therefore
+  sends `thinking: { "type": "disabled" }` on every request (opt out with
+  `"thinking": "enabled"` in the entry; proper reasoning passthrough is a
+  Phase 2 IR extension).
+- **`glm-4.7-flash` flaps.** It serves requests but intermittently 429s with
+  an upstream-capacity "temporarily overloaded" message (not an account
+  quota) — surfaced as `rate_limit_error` / probe `rate_limited` like any
+  other 429.
+
+### Live smoke (2026-11-08)
+
+Run against real providers with a real key (non-stream + 200-after-retry
+pattern):
+
+- **Verified working end-to-end (4 models):** `zai/glm-4.5-flash`,
+  `zai/glm-4.7-flash` (serves; see the flapping note above),
+  `openrouter/openrouter/free`, `openrouter/nvidia/nemotron-3.5-lightning:free`.
+- **Catalog adds free variants beyond `:free` ids**: the openrouter free
+  filter keeps an id ending in `:free` OR both `pricing.prompt` and
+  `pricing.completion` exactly `"0"` (e.g. `openrouter/openrouter/free` enters
+  the catalog through the pricing rule, as observed live).
+- **Dead-upstream free models 429 as `rate_limit_error`, as observed**: two
+  cataloged free ids (`google/gemma-4-26b-a4b-it:free`,
+  `liquid/lfm-3-1.7b:free`) answered with `UpstreamError` from dead upstreams —
+  normal free-provider flakiness, no action.
+- **Paid/retired ids were proven and removed** from the ZAI default list
+  (`glm-4.7-flashx`/`glm-4.5-air` paid; seven `glm-4*`/`glm-5*` ids retired
+  with "Unknown Model" 1211) — evidence kept in
+  `packages/sources/zai/src/models.ts`.
+- **Live flakiness (ρ = availability) data feeds the Phase 2 probes** — the
+  per-source health monitor and alias ranking will consume exactly these
+  availability observations.

@@ -94,7 +94,7 @@ describe("zai registry integration", () => {
     expect(zai?.["owned_by"]).toBe("zai");
     expect(zai?.["free"]).toBe(true);
     expect(zai?.["object"]).toBe("model");
-    expect(body.data.some((entry) => entry["id"] === "zai/glm-4.5-air")).toBe(true);
+    expect(body.data.some((entry) => entry["id"] === "zai/glm-4.7-flash")).toBe(true);
   });
 
   it("POST non-stream chat completion routes gateway → zai source → mock provider", async () => {

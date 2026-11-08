@@ -12,7 +12,7 @@ Currently landed:
 | Package | What it is |
 | --- | --- |
 | `openai-compat` | Shared kit for OpenAI-compatible providers (SSE → IR streaming, probe, non-stream `complete()`, offline-testable via fetch injection). See its README for the contract and exported API. |
-| `zai` | Z.AI (Zhipu AI) plugin built on `openai-compat`; wired into the CLI under the `"zai"` type, enabled in `config/airoute.json`, self-skips without `ZAI_API_KEY`. |
+| `zai` | Z.AI (Zhipu AI) plugin built on `openai-compat`; wired into the CLI under the `"zai"` type, enabled in `config/airoute.json`, self-skips without `ZAI_API_KEY`. Default models are live-verified free ids (`glm-4.5-flash`, `glm-4.7-flash`); requests ship `thinking: {"type": "disabled"}` by default so flash models answer in `content` instead of exhausting `max_tokens` on reasoning. |
 | `openrouter` | OpenRouter free-model plugin built on `openai-compat`; wired into the CLI under the `"openrouter"` type, enabled in `config/airoute.json`, self-skips without `OPENROUTER_API_KEY`. Fetches the live `GET /models` catalog (free filter → sort → `allow`/`disallow` → `maxModels` cap) or uses a static `models` override. |
 
 Next up (Phase 2): the sources gain the health-monitor hooks the ranker will

@@ -569,6 +569,99 @@ describe("createOpenAICompatSource — complete()", () => {
   });
 });
 
+describe("createOpenAICompatSource — extraBody", () => {
+  it("merges extraBody fields into the outgoing request body (stream + complete paths)", async () => {
+    const { source, requests } = kit(echoResponder, {
+      extraBody: { thinking: { type: "disabled" } },
+    });
+    const spec = (await source.listModels())[0]!;
+    await readAll(await source.stream({ model: spec, request: probeRequest }));
+    await source.complete(spec, probeRequest);
+
+    const streamBody = JSON.parse(requests[0]!.init?.body as string) as Record<string, unknown>;
+    expect(streamBody["thinking"]).toEqual({ type: "disabled" });
+    const completeBody = JSON.parse(requests[1]!.init?.body as string) as Record<string, unknown>;
+    expect(completeBody["thinking"]).toEqual({ type: "disabled" });
+  });
+
+  it("extraBody loses to kit-owned model/messages/stream but wins over mapped IR fields", async () => {
+    const { source, requests } = kit(echoResponder, {
+      extraBody: { model: "hijacked", messages: [], stream: false, max_tokens: 77 },
+    });
+    const spec = (await source.listModels())[0]!;
+    await readAll(await source.stream({ model: spec, request: { ...probeRequest, max_tokens: 5 } }));
+
+    const body = JSON.parse(requests[0]!.init?.body as string) as Record<string, unknown>;
+    // kit-owned fields ignore source-specific overrides…
+    expect(body["model"]).toBe("m1");
+    expect(body["stream"]).toBe(true); // always-stream-upstream contract
+    expect((body["messages"] as unknown[]).length).toBe(1);
+    // …while provider knobs beat the fields mapped from the IR request.
+    expect(body["max_tokens"]).toBe(77);
+  });
+
+  it("absence of extraBody is a no-op (body has exactly the mapped fields)", async () => {
+    const { source, requests } = kit(echoResponder);
+    const spec = (await source.listModels())[0]!;
+    await readAll(await source.stream({ model: spec, request: probeRequest }));
+    const body = JSON.parse(requests[0]!.init?.body as string) as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(["messages", "model", "stream"]);
+  });
+});
+
+describe("createOpenAICompatSource — reasoning_content stripping", () => {
+  it("maps a reasoning-carrying delta to a content-absent chunk (no reasoning text leaks)", async () => {
+    const { source } = kit(() =>
+      sse(
+        wireChunk({ role: "assistant" }),
+        data({
+          id: "c1",
+          object: "chat.completion.chunk",
+          created: 0,
+          model: "m1",
+          choices: [{ index: 7, delta: { reasoning_content: "thinking…", content: "" }, finish_reason: null }],
+        }),
+        wireChunk({ content: "answer" }),
+        wireChunk({ finish: "stop" }),
+        "data: [DONE]",
+        "",
+      ),
+    );
+    const spec = (await source.listModels())[0]!;
+    const chunks = await readAll(await source.stream({ model: spec, request: probeRequest }));
+
+    expect(chunks).toHaveLength(4);
+    expect(chunks[0]).toMatchObject({ index: 0, role: "assistant" });
+    // the reasoning delta normalized to a plain content-absent chunk
+    expect(chunks[1]).toEqual({ index: 1 });
+    expect(JSON.stringify(chunks[1])).not.toContain("thinking");
+    expect(chunks.flatMap((c) => c.content ?? []).join("")).toBe("answer");
+    expect(chunks[2]).toMatchObject({ index: 2, content: "answer" });
+    expect(chunks[3]).toMatchObject({ index: 3, finishReason: "stop", done: true });
+  });
+
+  it("drops message.reasoning_content in complete() (content '', finishReason passthrough)", async () => {
+    const { source } = kit(() =>
+      json({
+        id: "c5",
+        object: "chat.completion",
+        created: 0,
+        model: "m1",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "", reasoning_content: "chain of thought" },
+            finish_reason: "length",
+          },
+        ],
+      }),
+    );
+    const spec = (await source.listModels())[0]!;
+    const completion = await source.complete(spec, probeRequest);
+    expect(completion).toEqual({ content: "", finishReason: "length", role: "assistant" });
+  });
+});
+
 describe("createOpenAICompatSource — option validation", () => {
   it("rejects malformed options with readable ConfigErrors", () => {
     expect(() =>
@@ -591,6 +684,9 @@ describe("createOpenAICompatSource — option validation", () => {
     expect(() =>
       createOpenAICompatSource({ id: "kit", baseUrl: "https://ok", models: [{ id: "x" }], timeoutMs: -5 }),
     ).toThrow(/timeoutMs/);
+    expect(() =>
+      createOpenAICompatSource({ id: "kit", baseUrl: "https://ok", models: [{ id: "x" }], extraBody: "nope" as unknown as Record<string, unknown> }),
+    ).toThrow(/extraBody/);
   });
 
   it("exposes the validation helpers and defaults for host sources", () => {

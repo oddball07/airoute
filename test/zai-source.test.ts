@@ -11,6 +11,7 @@ import {
   createZaiSourceFactory,
   DEFAULT_ZAI_BASE_URL,
   DEFAULT_ZAI_MODELS,
+  DEFAULT_ZAI_THINKING,
   ZAI_ENV_KEY,
   type ZaiSourceOptions,
 } from "@airoute/zai";
@@ -66,9 +67,7 @@ describe("createZaiSource — construction & listModels", () => {
     const ids = specs.map((spec) => spec.id);
     expect(ids).toEqual([
       "zai/glm-4.5-flash",
-      "zai/glm-4-flash-250414",
-      "zai/glm-4-flashx-250414",
-      "zai/glm-4.5-air",
+      "zai/glm-4.7-flash",
     ]);
     for (const spec of specs) {
       expect(spec.sourceId).toBe("zai");
@@ -81,12 +80,10 @@ describe("createZaiSource — construction & listModels", () => {
     }
   });
 
-  it("DEFAULT_ZAI_MODELS is the source of truth for the default list", () => {
+  it("DEFAULT_ZAI_MODELS is the source of truth for the default list (verified 2026-11-08)", () => {
     expect(DEFAULT_ZAI_MODELS.map((def) => def.id)).toEqual([
       "glm-4.5-flash",
-      "glm-4-flash-250414",
-      "glm-4-flashx-250414",
-      "glm-4.5-air",
+      "glm-4.7-flash",
     ]);
   });
 
@@ -142,6 +139,46 @@ describe("createZaiSource — construction & listModels", () => {
     expect(bad({ baseUrl: "nope" })?.message).toContain("baseUrl");
     expect(bad({ timeoutMs: 0 })?.message).toContain("timeoutMs");
     expect(bad({ models: [{ id: "" }] })?.message).toContain("models[0].id");
+    expect(bad({ thinking: "fast" as unknown as ZaiSourceOptions["thinking"] })?.message).toContain('"thinking"');
+  });
+});
+
+describe("createZaiSource — thinking control", () => {
+  const capturingKitFetch = (bodies: Array<Record<string, unknown> | undefined>): typeof fetch =>
+    (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(init?.body as string) as Record<string, unknown>);
+      return new Response("data: [DONE]\n", {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+  it("defaults thinking to 'disabled': outgoing requests carry thinking {type:'disabled'}", async () => {
+    const bodies: Array<Record<string, unknown> | undefined> = [];
+    const source = createZaiSource({ apiKey: "test", fetch: capturingKitFetch(bodies) });
+    const spec = (await source.listModels())[0]!;
+    await readAll(
+      await source.stream({
+        model: spec,
+        request: { model: spec.id, messages: [{ role: "user", content: "x" }] },
+      }),
+    );
+    // Verified live (2026-11-08): thinking-off makes glm-4.5-flash answer in
+    // `content` instead of exhausting max_tokens on reasoning_content.
+    expect(bodies[0]?.["thinking"]).toEqual({ type: "disabled" });
+  });
+
+  it("thinking 'enabled' omits the extra body field entirely (ZAI decides)", async () => {
+    const bodies: Array<Record<string, unknown> | undefined> = [];
+    const source = createZaiSource({ apiKey: "test", thinking: "enabled", fetch: capturingKitFetch(bodies) });
+    const spec = (await source.listModels())[0]!;
+    await readAll(
+      await source.stream({
+        model: spec,
+        request: { model: spec.id, messages: [{ role: "user", content: "x" }] },
+      }),
+    );
+    expect(bodies[0]?.["thinking"]).toBeUndefined();
   });
 });
 
@@ -194,6 +231,13 @@ describe("createZaiSourceFactory — config entry handling", () => {
     expectConfigError({ models: [{ id: "x", caps: { tools: "yes" } }] }, "models[0].caps.tools");
     expectConfigError({ models: [{ id: "x", aliases: [7] }] }, "models[0].aliases");
     expectConfigError({ timeoutMs: "fast" }, '"timeoutMs"');
+    expectConfigError({ thinking: "fast" }, '"thinking"');
+  });
+
+  it("accepts both thinking values from an entry; bare entries default to 'disabled'", () => {
+    expect(DEFAULT_ZAI_THINKING).toBe("disabled");
+    expect(createZaiSourceFactory({ type: "zai", enabled: true, thinking: "disabled" }).id).toBe("zai");
+    expect(createZaiSourceFactory({ type: "zai", enabled: true, thinking: "enabled" }).id).toBe("zai");
   });
 });
 

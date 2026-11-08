@@ -104,6 +104,17 @@ export interface OpenAICompatOptions {
   apiKey?: string;
   /** Extra static headers merged beneath per-request headers. */
   headers?: Record<string, string>;
+  /**
+   * Provider-specific body fields merged LAST into the outgoing chat
+   * completion request — on top of the fields mapped from the IR request —
+   * so sources can send provider knobs the Phase 1 IR has no field for
+   * (e.g. zai's `thinking` control). Precedence: an `extraBody` field beats
+   * the mapped IR fields, but LOSES to the three kit-owned fields `model`,
+   * `messages` and `stream`: source-specific overrides of those three are
+   * ignored (they pin request identity and the always-stream-upstream
+   * contract).
+   */
+  extraBody?: Record<string, unknown>;
   /** Static model list (this kit does not fetch /models). */
   models: SourceModelDef[];
   /** Idle timeout; default {@link DEFAULT_OPENAI_COMPAT_TIMEOUT_MS}. */
@@ -233,6 +244,9 @@ export function createOpenAICompatSource(options: OpenAICompatOptions): OpenAICo
   if (options.fetch !== undefined && typeof options.fetch !== "function") {
     throw new ConfigError(`openai-compat source "${id}": option "fetch" must be a function`);
   }
+  if (options.extraBody !== undefined && !isRecord(options.extraBody)) {
+    throw new ConfigError(`openai-compat source "${id}": option "extraBody" must be an object`);
+  }
   validateHeaders(options.headers, `openai-compat source "${id}"`);
   const timeoutMs =
     options.timeoutMs === undefined
@@ -240,6 +254,7 @@ export function createOpenAICompatSource(options: OpenAICompatOptions): OpenAICo
       : validateTimeoutMs(options.timeoutMs, `openai-compat source "${id}"`);
   const models = validateSourceModelDefs(options.models, `openai-compat source "${id}"`);
   const apiKey = options.apiKey ?? undefined;
+  const extraBody = options.extraBody; // undefined = no extra fields (no-op)
   const fetchFn = options.fetch ?? globalThis.fetch;
   const chatUrl = `${baseUrl}/chat/completions`;
 
@@ -426,10 +441,25 @@ export function createOpenAICompatSource(options: OpenAICompatOptions): OpenAICo
     const init: RequestInit & { signal?: AbortSignal } = {
       method: "POST",
       headers: requestHeaders(extraHeaders),
-      body: JSON.stringify(body),
+      body: JSON.stringify(withExtraBody(body)),
     };
     if (signal !== undefined) init.signal = signal;
     return fetchFn(chatUrl, init);
+  }
+
+  /**
+   * Merge `extraBody` into the outgoing chat-completion body: source-specific
+   * fields land ON TOP of the mapped IR fields, but the kit-owned `model`,
+   * `messages` and `stream` are re-applied last so they always win (they pin
+   * request identity and the kit's always-stream-upstream contract).
+   */
+  function withExtraBody(body: OpenAIChatRequest): OpenAIChatRequest & Record<string, unknown> {
+    if (extraBody === undefined) return body as OpenAIChatRequest & Record<string, unknown>;
+    const merged = { ...body, ...extraBody } as OpenAIChatRequest & Record<string, unknown>;
+    merged.model = body.model;
+    merged.messages = body.messages;
+    merged.stream = body.stream;
+    return merged;
   }
 
   /** A short-lived POST: whole request (connection + response headers) raced against the timeout. */
@@ -611,12 +641,29 @@ function completionFromBody(parsed: unknown): OpenAICompatCompletion {
   const message = isRecord(first["message"]) ? first["message"] : undefined;
   const rawContent = message?.["content"];
   const content = typeof rawContent === "string" ? rawContent : "";
+  // message.reasoning_content (thinking models, e.g. ZAI) is deliberately
+  // dropped: reasoning_content passthrough is a Phase 2 IR extension; today a
+  // reasoning-only non-stream completion maps to a content:"" completion and
+  // finishReason passes through untouched.
   const rawRole = message?.["role"];
   const role = typeof rawRole === "string" && ROLES.includes(rawRole) ? (rawRole as Role) : "assistant";
   const rawFinish = first["finish_reason"];
   const finishReason =
     rawFinish === "stop" || rawFinish === "length" || rawFinish === "tool_calls" ? rawFinish : null;
   return { content, finishReason, role };
+}
+
+/**
+ * True when any choice delta of this wire chunk carries a
+ * `reasoning_content` field (ZAI thinking models, OpenRouter free-router
+ * reasoning variants). The Phase 1 IR has no reasoning lane, so the kit
+ * strips the text and emits the chunk as a normal content-absent delta.
+ */
+function wireCarriesReasoningDelta(chunk: unknown): boolean {
+  if (!isRecord(chunk) || !Array.isArray(chunk["choices"])) return false;
+  return chunk["choices"].some(
+    (choice) => isRecord(choice) && isRecord(choice["delta"]) && choice["delta"]["reasoning_content"] !== undefined,
+  );
 }
 
 /**
@@ -652,7 +699,13 @@ function irChunkStreamFromSse(
       const hasRole = ir.role !== undefined;
       const hasContent = ir.content !== undefined;
       const hasFinish = ir.finishReason != null;
-      if (!hasRole && !hasContent && !hasFinish) continue; // keep-alive / empty choices
+      // reasoning_content passthrough is a Phase 2 IR extension; today
+      // providers' reasoning-only chunks (e.g. ZAI interleaved chatcmpl ids,
+      // OpenRouter free-router reasoning) normalize to empty content deltas:
+      // the reasoning text is stripped and the chunk still flows with
+      // content-absent shape + correct role/finish bookkeeping.
+      const hasData = hasRole || hasContent || hasFinish || wireCarriesReasoningDelta(wire);
+      if (!hasData) continue; // keep-alive / empty choices
 
       const out: IRChunk = { index: index++ };
       if (!roleSent) {

@@ -69,7 +69,7 @@
     },
     "aliases": {
       "type": "object",
-      "description": "Gateway-level model aliases, e.g. \"free-best\": [\"zai/glm-4.5-air\", \"openrouter/model-id\"]; the first enabled candidate wins (ranking arrives in Phase 2).",
+      "description": "Gateway-level model aliases, e.g. \"free-best\": [\"zai/glm-4.5-flash\", \"openrouter/model-id\"]; the first enabled candidate wins (ranking arrives in Phase 2).",
       "additionalProperties": {
         "type": "array",
         "items": { "type": "string" }

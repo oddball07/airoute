@@ -41,6 +41,7 @@ uses). Register it either directly (`registry.register(source)`) or through a
 | `baseUrl` | Required, must be `http(s)://…`; trailing slashes trimmed. |
 | `apiKey` | Optional; omit the `Authorization` header when unset. **Never logged.** |
 | `headers` | Optional record of strings, under per-request headers. |
+| `extraBody` | Optional record merged LAST into the outgoing chat-completion body (provider fields the IR has no slot for). Beats mapped IR fields, but loses to the kit-owned `model` / `messages` / `stream`. Non-object → `ConfigError`. |
 | `models` | Required array of `SourceModelDef`. Empty array allowed (advertises nothing). |
 | `timeoutMs` | Optional positive ms; default 60 000. Idle timeout for the fetch and every stream read. |
 | `fetch` | Optional replacement for `globalThis.fetch` — the offline-test seam. |
@@ -71,6 +72,13 @@ https://`, `models[2].contextWindow must be a non-negative integer`, …).
    present; a 2xx chat-completion JSON body (provider streamed even though
    asked otherwise, or ignored `stream:false`) is converted into an equivalent
    chunk stream / `complete()` result.
+6. **`reasoning_content` is stripped, not passed through** — deliberately. The
+   Phase 1 IR has no reasoning lane: a delta carrying `reasoning_content`
+   (ZAI thinking models, OpenRouter free-router reasoning) normalizes to a
+   content-absent chunk, and a non-stream `message.reasoning_content` maps to
+   a `content: ""` completion (finishReason untouched). Proper reasoning
+   passthrough is a Phase 2 IR extension. (Host sources that need the other
+   direction — like zai's `thinking` control — use `extraBody`.)
 
 ### Error mapping (non-2xx or JSON error bodies)
 
@@ -150,7 +158,7 @@ createOpenAICompatSource(options: OpenAICompatOptions): OpenAICompatSource
 DEFAULT_OPENAI_COMPAT_TIMEOUT_MS: number
 DEFAULT_OPENAI_COMPAT_CAPS: Readonly<ModelCaps>
 
-interface OpenAICompatOptions { id; baseUrl; apiKey?; headers?; models: SourceModelDef[]; timeoutMs?; fetch? }
+interface OpenAICompatOptions { id; baseUrl; apiKey?; headers?; extraBody?; models: SourceModelDef[]; timeoutMs?; fetch? }
 interface SourceModelDef { id; label?; contextWindow?; caps?: Partial<ModelCaps>; aliases?: string[] }
 interface OpenAICompatCompletion { content; finishReason; role }
 interface OpenAICompatSource extends Source { complete(model, request): Promise<OpenAICompatCompletion> }

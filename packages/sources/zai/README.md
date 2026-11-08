@@ -13,6 +13,9 @@ In `config/airoute.json` (`sources.registry`), all options optional:
 
 - `baseUrl` — override `DEFAULT_ZAI_BASE_URL` (`https://api.z.ai/api/paas/v4`).
 - `models` — replaces the default `DEFAULT_ZAI_MODELS` list entirely.
+- `thinking` — `"disabled"` (default) ships
+  `extraBody: { "thinking": { "type": "disabled" } }` on every request;
+  `"enabled"` omits the field entirely (let ZAI decide). See below.
 - `timeoutMs` — idle timeout (default 60 s), see the kit README.
 
 Malformed options throw `ConfigError` naming the offending option, which
@@ -30,12 +33,25 @@ source 'zai' disabled: no key (ZAI_API_KEY is not set)
 
 Keys are read from the environment only — never from config, never logged.
 
-## Default models (flash tier)
+## Default models (flash tier, verified live 2026-11-08)
 
-`glm-4.5-flash`, `glm-4-flash-250414`, `glm-4-flashx-250414`, and
-`glm-4.5-air`. All gated `free: true` (Phase 1 is free-only). Verify free
-status at live smoke after keys arrive — `glm-4.5-air`'s is ambiguous; see the
-comment in `src/models.ts`. Context windows assume the advertised 128K.
+`glm-4.5-flash` and `glm-4.7-flash` — both verified FREE and working end-to-end
+against `api.z.ai`. All gated `free: true` (Phase 1 is free-only).
+
+- **Thinking default disabled**: with default settings `glm-4.5-flash` is a
+  thinking model — with `max_tokens: 100` the whole budget went to
+  `message.reasoning_content` and `content` came back `""` with
+  finish_reason=length. The source therefore ships
+  `thinking: { "type": "disabled" }` by default (set `"thinking": "enabled"`
+  in the entry to get the reasoning stream instead; proper reasoning
+  passthrough is planned for Phase 2).
+- **`glm-4.7-flash` capacity flapping**: serves requests but intermittently
+  429s with "The service may be temporarily overloaded" (upstream capacity,
+  not account quota) — it maps to `rate_limit_error` / probe `rate_limited`
+  like any other 429; Phase 2 probes will quantify the flap rate.
+- Retired/paid ids were probed and removed from the list — see the evidence
+  comment in `src/models.ts` before re-adding anything. Context windows assume
+  the advertised 128K.
 
 ## Factory exports
 
@@ -43,4 +59,5 @@ comment in `src/models.ts`. Context windows assume the advertised 128K.
   wired into `packages/cli/src/cli.ts` under the `"zai"` type.
 - `createZaiSource(options?: ZaiSourceOptions): Source` — direct constructor
   for tests (`baseUrl`, `apiKey`, `fetch`, … overrides).
-- `DEFAULT_ZAI_MODELS`, `DEFAULT_ZAI_BASE_URL`, `DEFAULT_ZAI_SOURCE_ID`, `ZAI_ENV_KEY`.
+- `DEFAULT_ZAI_MODELS`, `DEFAULT_ZAI_BASE_URL`, `DEFAULT_ZAI_SOURCE_ID`,
+  `DEFAULT_ZAI_THINKING`, `ZAI_ENV_KEY`.
