@@ -11,6 +11,10 @@ with `403` at runtime if one ever appears.
 CLI agent (OpenCode) ──▶ airoute: POST /v1/chat/completions ──▶ source plugin ──▶ provider
 ```
 
+Picking this up in a fresh session (or after a long break)? Read
+[`HANDOFF.md`](./HANDOFF.md) first — it has the current state, verification
+commands, gotchas, and next steps.
+
 ## Layout
 
 | Path | What it is |

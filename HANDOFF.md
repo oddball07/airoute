@@ -1,0 +1,180 @@
+# AIRoute — session handoff brief
+
+**Purpose of this file:** start a new agent session from here when the previous
+one is near its context limit. Everything below is current as of the last commit
+on `main`; verify with the commands in §2 before trusting details.
+
+Repo: `D:\tools\airoute` · Branch: `main` · Written: 2026-11-09
+
+---
+
+## 1. What this project is
+
+AIRoute is a **local aggregation gateway** between CLI coding agents (OpenCode
+first) and free AI provider "sources". A source is a plugin implementing one
+TypeScript interface; the gateway exposes a single OpenAI-compatible endpoint
+and routes each request to a free model (`zai/glm-4.5-flash`, alias `free-best`, …).
+
+```
+CLI agent (OpenCode) ──▶ airoute: POST /v1/chat/completions ──▶ source plugin ──▶ provider
+```
+
+**Non-negotiable rules (do not relax these):**
+
+- **Free models only.** Paid models must never be routable. The catalog type
+  gates them, and the gateway returns `403` if one ever reaches routing.
+- **OpenCode is the primary CLI.** Claude Code, Cline, and other CLIs are
+  secondary and stay untouched until the OpenCode gates pass (they do now for
+  Phase 3, but no secondary-CLI work has started).
+- **API-first.** Every model is reached through a stable machine endpoint;
+  web-chat automation (WebSource) is a deferred Phase 6 bonus tier.
+- **Secrets live in `.env` only.** Never read, print, log, or commit `.env`.
+  The user's keys are `ZAI_API_KEY` and `OPENROUTER_API_KEY` (no Qwen key).
+- **Offline tests.** `npm test` must never hit the network or real providers.
+- **Minimal dependencies.** Do not add runtime deps without a reason.
+
+## 2. Verify current state first
+
+```powershell
+cd D:\tools\airoute
+git log --oneline -3      # expect ccce547 (phase3) at the tip, or newer
+git status --short        # should be clean
+npm run build             # tsc -b, must be clean
+npm test                  # vitest run — 256 tests / 23 files, all offline
+```
+
+If the test count is lower than expected, stop and find out what was reverted
+before continuing.
+
+## 3. Architecture map
+
+| Path | What lives there |
+| --- | --- |
+| `packages/core` | IR types, OpenAI wire mappers, source registry, router, config loader, logger, errors |
+| `packages/gateway` | HTTP server: `/healthz`, `/v1/models`, `/v1/chat/completions` (SSE + non-stream) |
+| `packages/monitor` | SQLite metrics store (`node:sqlite`), probe scheduler, circuit breaker, ranker |
+| `packages/opencode` | OpenCode V2 custom-provider config builder + atomic installer + JSONC parser |
+| `packages/cli` | `serve`, `models`, `status`, `install-opencode` |
+| `packages/sources/openai-compat` | shared kit: request building, SSE parsing, tool-call accumulation |
+| `packages/sources/zai`, `packages/sources/openrouter` | concrete free-tier sources |
+| `e2e/mock-provider` | deterministic fake provider + mock `Source` used by tests |
+| `scripts/opencode-gate-gateway.mjs` | deterministic gate harness (port 8799) for failover + degraded skip |
+| `config/airoute.json` | default config (zai + openrouter enabled, self-skip without key) |
+| `test/` | vitest suite, no network |
+| `C:\Users\hiten\.opencode\plan\airoute-plan.md` | the long-form project plan and phase table |
+
+Key module entry points:
+
+- `packages/gateway/src/server.ts` — `startGateway(options)`, routing, failover,
+  non-stream aggregation (`bufferCompletion`), SSE forwarding.
+- `packages/core/src/openai-wire.ts` — OpenAI ⇄ IR both directions, including
+  `delta.tool_calls`; **`choices[0].index` is always 0**, while `IRChunk.index`
+  is a chunk sequence counter (do not "fix" this back).
+- `packages/opencode/src/install.ts` — atomic write (temp + rename), `.bak`,
+  dry-run, idempotency.
+- `packages/opencode/src/config.ts` — catalog → `ModelSpec`, free-only and `#`
+  guards, provider block builder/merge.
+
+## 4. Running it
+
+```powershell
+npm start                     # gateway on http://127.0.0.1:8787 (uses .env if present)
+airoute status                # ranked free models + breaker state + uptime
+airoute install-opencode      # write/merge global OpenCode config
+airoute install-opencode --project .            # project-local ./opencode.json
+airoute install-opencode --url http://127.0.0.1:8787   # install from a gateway catalog
+```
+
+OpenCode end-to-end:
+
+```powershell
+opencode models                                   # airoute/* entries appear
+opencode run --standalone --model airoute/free-best "hi"
+opencode run --standalone --auto --model airoute/zai/glm-4.5-flash "Use the shell tool to run: echo TOOL-OK"
+```
+
+Providers exposed by the gateway: `zai/*`, `openrouter/*`, plus aliases
+`free-best`, `free-coder`, `free-fast`. Selectable ids are `airoute/<key>`.
+
+## 5. Phase status
+
+- **Phase 0 (done)** — skeleton, IR, registry, router, streaming gateway, mock, CLI.
+- **Phase 1 (done)** — live ZAI + OpenRouter free sources, catalog caching, idle stream timeout.
+- **Phase 2 (done)** — SQLite metrics, probe scheduler, circuit breaker, passive
+  signals, ranker, health-aware failover, `airoute status`, `/healthz` monitor block.
+- **Phase 3 (done, commit `ccce547`)** — `@airoute/opencode`, `install-opencode`,
+  tool calling end-to-end, `/v1/models` aliases, gate harness.
+
+Phase 3 gates that were actually run green against real OpenCode:
+
+1. Discovery — `opencode models` lists `airoute/*`.
+2. Streaming + multi-turn — reply `OK`, then `-c` recalled `PINEAPPLE`.
+3. Tool calls — ran `echo TOOL-OK` through the shell tool.
+4. Failover — alias whose first candidate 429s → `STEADY-OK`.
+5. Degraded skip — alias whose first candidate is cooling → `STEADY-OK`.
+
+Gates 4–5 are reproducible offline:
+
+```powershell
+node scripts/opencode-gate-gateway.mjs                     # listens on 127.0.0.1:8799
+airoute install-opencode --project $tmp --url http://127.0.0.1:8799
+# in $tmp: opencode run --standalone --model airoute/free-failover "Reply with GATE-OK"
+```
+
+## 6. Known limitations / open items
+
+- **Reasoning content is dropped.** ZAI thinking models send `reasoning_content`;
+  the kit strips it and the zai source disables thinking by default. Proper
+  passthrough is still an unresolved IR extension.
+- **`glm-4.7-flash` flaps** with upstream-capacity 429s (not account quota).
+- **Failover/degradation evidence** for the gate comes from the deterministic
+  harness; live providers cannot be forced to 429 on demand.
+- **No auth on the gateway.** It binds `127.0.0.1`; it is not safe to expose.
+- **No remote/push configured.** `git remote -v` is empty as of this writing.
+- Reasoning/cost reporting beyond `cost: {input:0, output:0}` is not implemented.
+
+## 7. Next up (Phase 4)
+
+Per the plan, Phase 4 is **alias UX polish** (making `free-best` etc. explain
+themselves in `status`/`models`, alias-aware errors and hints), plus a plugin
+fallback **only if** the config-based provider proves insufficient. Re-run the
+Phase 3 gates on live sources after any routing change.
+
+Phase 5 (Anthropic `/v1/messages` → Claude Code) is explicitly gated behind
+Phase 4 sign-off. Do not start it early.
+
+## 8. Environment gotchas (learned the hard way)
+
+- **Windows PowerShell 5**: no `&&` / `||`; use `;`. Native stderr like
+  `opencode.exe :` is expected noise — check `exit=$LASTEXITCODE` and answer text.
+- **Build before running**: the CLI runs `packages/cli/dist`, so `npm run build`
+  after every source change.
+- **`Start-Job` children die with the PowerShell invocation.** Start the gateway
+  and run `opencode` in the *same* script, or use a detached process.
+- **Stale listeners** hold ports 8787/8799. Kill with
+  `Get-NetTCPConnection -LocalPort <p> -State Listen` → `Stop-Process`.
+- **Temp dirs** used by gate runs: `%TEMP%\airoute-e2e` (real gateway) and
+  `%TEMP%\airoute-gate` (harness).
+- **`data/airoute.db`** holds live probe metrics (gitignored); `AIRROUTE_DB`
+  overrides the path. Delete it to reset health state.
+- OpenCode v2.2.6 is installed; use `--standalone` for isolated runs and
+  `--auto` to auto-approve tools in non-interactive checks.
+
+## 9. Model / agent preferences
+
+- For coding agents and subagents, the user asked for
+  `opencode/glm-5.3-flash-free#high` (free-tier quota reasons). If that model is
+  rate-limited, tell the user rather than silently switching.
+
+## 10. Handoff checklist (fill in before starting the new session)
+
+- [ ] Last thing I was working on: ______
+- [ ] Uncommitted changes: ______ (`git status --short`)
+- [ ] Decision waiting on the user: ______
+- [ ] Anything I tried that failed: ______
+
+## 11. What to tell the new session
+
+> Read `HANDOFF.md` in `D:\tools\airoute` first, then run the §2 verification
+> commands. Continue from §7 (Phase 4) unless I say otherwise. Keep the rules in
+> §1: free models only, OpenCode first, no secrets in logs, offline tests.
