@@ -20,7 +20,7 @@ commands, gotchas, and next steps.
 | Path | What it is |
 | --- | --- |
 | `packages/core` | `@airoute/core` — IR types, OpenAI wire mappers, source registry, router, config loader, logger |
-| `packages/gateway` | `@airoute/gateway` — HTTP server (real SSE streaming) |
+| `packages/gateway` | `@airoute/gateway` — HTTP server (real SSE streaming) + Phase 7 dashboard (`/dashboard`, snapshot JSON) |
 | `packages/monitor` | `@airoute/monitor` — SQLite metrics store, probe scheduler, circuit breaker, model ranking |
 | `packages/cli` | `@airoute/cli` — thin CLI: `serve`, `models`, `status`, `install-opencode` |
 | `packages/opencode` | `@airoute/opencode` — OpenCode V2 custom-provider config builder + installer (JSONC-aware merge, free-only) |
@@ -38,6 +38,9 @@ npm test             # vitest run
 npm start            # airoute serve (node --env-file-if-exists=.env)
 npm run dev          # tsx watch serve
 ```
+
+`npm start` prints `http://127.0.0.1:8787/dashboard`; open it in a browser for
+live health, rankings and the uptime heatmap (see *Dashboard* below).
 
 The CLI's `--env-file-if-exists=.env` means: copy `.env.example` to `.env`, add
 your keys (`ZAI_API_KEY`, `OPENROUTER_API_KEY`), and they're picked up in
@@ -273,6 +276,34 @@ aliases:
 hints) and `--json` emits `{ models, aliases }` with per-candidate state, so
 scripts and future dashboards do not have to re-implement resolution.
 
+## Dashboard (Phase 7)
+
+`airoute serve` also serves a server-rendered dashboard at
+**http://127.0.0.1:8787/dashboard** (the URL is logged at startup). It is one
+self-contained HTML string — no CDN, fonts, or new dependencies — that polls
+`/dashboard/api/snapshot` every 3 s.
+
+| Panel | Shows |
+| --- | --- |
+| summary | model count, routable count, cooling/down, mean 24 h uptime, gateway uptime |
+| sources | availability bar per source, failure-kind chips, **pressure** bar |
+| aliases | each alias's mode/fallback, first routable candidate, per-state counts, ordered candidates |
+| ranking | the same `rankModels` order routing uses, with score, state, uptime, p50, context, caps |
+| uptime | 24 hourly buckets per model, colored by probe success rate (falls back to request success, then "no data") |
+| activity | newest probes/requests with outcome, latency and error kind |
+
+Honest limits: AIRoute cannot see a provider's remaining quota, so "pressure"
+is the share of *observed failures* in the window that were capacity/429 or
+auth/quota — a proxy for trouble, not a quota meter. The dashboard has no auth
+of its own; it inherits the gateway bind (`127.0.0.1` by default), which is why
+that default must stay loopback-only.
+
+Snapshot JSON is stable and scriptable: `{ generatedAt, startedAt, uptimeMs,
+version, configPath?, refreshMs, window, summary, sources, models, aliases,
+recent }`; each model carries its 24 buckets, score breakdown and live breaker
+state. Omit `GatewayOptions.dashboard` when embedding the gateway to serve a
+catalog-only snapshot (no metrics store attached).
+
 ## Phase status
 
 - **Phase 0 (done)** — skeleton, types, registry, router, streaming gateway,
@@ -311,8 +342,17 @@ scripts and future dashboards do not have to re-implement resolution.
   tool request routed to a tool-capable model, explicit tool-less model rejected
   with 400, and the Phase 3 gates re-run green.
 - **Phase 5 (deferred)** — Anthropic `/v1/messages` → Claude Code. Parked by
-  request (2026-11-09); OpenCode remains the only target. Next OpenCode work is
-  install diagnostics (`doctor`, `--check`) and catalog/config sync.
+  request (2026-11-09); OpenCode remains the only target.
+- **Phase 6 (skipped)** — WebSource (login flows, cookie vault). Deferred by
+  request (2026-11-09) in favour of the dashboard and hardening.
+- **Phase 7 (done)** — dashboard: `/dashboard` HTML + `/dashboard/api/snapshot`
+  JSON in `@airoute/gateway`, fed by three new store reads
+  (`getUptimeBuckets`, `getRecentActivity`, `getFailureKinds`). 24 h heatmap,
+  live ranking/alias state, source availability and failure pressure, activity
+  feed. 293 offline tests; live-checked against the 18-model catalog.
+- **Phase 8 (next)** — hardening: account rotation (multi-key sources), more
+  free API sources, full OpenCode e2e suite as a command, and operational items
+  (dashboard guard, probe budget, `doctor` / stale-config check).
 
 ### Z.AI (zai source)
 

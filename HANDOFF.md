@@ -37,10 +37,10 @@ CLI agent (OpenCode) ──▶ airoute: POST /v1/chat/completions ──▶ sour
 
 ```powershell
 cd D:\tools\airoute
-git log --oneline -3      # expect the Phase 4.5 commit at the tip, or newer
+git log --oneline -3      # expect the Phase 7 dashboard commit at the tip, or newer
 git status --short        # should be clean
 npm run build             # tsc -b, must be clean
-npm test                  # vitest run - 283 tests / 26 files, all offline
+npm test                  # vitest run - 293 tests / 27 files, all offline
 ```
 
 If the test count is lower than expected, stop and find out what was reverted
@@ -51,7 +51,7 @@ before continuing.
 | Path | What lives there |
 | --- | --- |
 | `packages/core` | IR types, OpenAI wire mappers, source registry, router, tokens (`estimateRequestTokens`), config loader, logger, errors |
-| `packages/gateway` | HTTP server: `/healthz`, `/v1/models`, `/v1/chat/completions` (SSE + non-stream); capability-aware candidate filter |
+| `packages/gateway` | HTTP server: `/healthz`, `/v1/models`, `/v1/chat/completions` (SSE + non-stream), `/dashboard` + `/dashboard/api/snapshot`; capability-aware candidate filter; dashboard module (`src/dashboard.ts`) |
 | `packages/monitor` | SQLite metrics store (`node:sqlite`), probe scheduler, circuit breaker, ranker |
 | `packages/opencode` | OpenCode V2 custom-provider config builder (honest alias metadata) + atomic installer + JSONC parser |
 | `packages/cli` | `serve`, `models`, `status`, `install-opencode` (+ `alias-view`) |
@@ -79,6 +79,7 @@ Key module entry points:
 
 ```powershell
 npm start                     # gateway on http://127.0.0.1:8787 (uses .env if present)
+# dashboard:  http://127.0.0.1:8787/dashboard   (JSON at /dashboard/api/snapshot)
 airoute models --json         # catalog + alias wiring (machine-readable)
 airoute status                # ranked free models + per-alias health
 airoute status --json         # same, for scripts/dashboards
@@ -117,6 +118,21 @@ Providers exposed by the gateway: `zai/*`, `openrouter/*`, plus aliases
   installed into OpenCode now carry honest `capabilities.tools` and
   `limit.context` derived from their candidates. 283 tests; live tool call
   routed to a tools-capable model, tool-less model 400s, gates green.
+- **Phase 5 (deferred)** — Anthropic `/v1/messages` → Claude Code; user chose
+  OpenCode-only (2026-11-09).
+- **Phase 6 (skipped)** — WebSource (login/cookie automation); user deferred it
+  (2026-11-09) to do the dashboard and hardening first.
+- **Phase 7 (done)** — dashboard in `@airoute/gateway`: `/dashboard` (one
+  self-contained HTML page, no CDN) polls `/dashboard/api/snapshot` every 3 s.
+  Snapshot = 24 hourly uptime buckets per model (probe rate, else request
+  rate), `rankModels` order/score breakdown, breaker state/cooldown, alias
+  resolution from `describeAliases`, per-source availability + failure chips +
+  "pressure" (share of failures that are 429/capacity or auth — honest proxy,
+  not a quota meter), and a recent probe/request feed. Store reads added:
+  `getUptimeBuckets`, `getRecentActivity`, `getFailureKinds`. Without
+  `GatewayOptions.dashboard` the routes still answer, but with a catalog-only
+  snapshot (no store/uptime). 293 tests; live-checked:
+  18 models / 3 aliases / 14 routable with real DB.
 
 Phase 3 gates that were actually run green against real OpenCode:
 
@@ -143,6 +159,11 @@ airoute install-opencode --project $tmp --url http://127.0.0.1:8799
 - **Failover/degradation evidence** for the gate comes from the deterministic
   harness; live providers cannot be forced to 429 on demand.
 - **No auth on the gateway.** It binds `127.0.0.1`; it is not safe to expose.
+  The dashboard is equally unauthenticated and shows failure detail — keep the
+  bind loopback (Phase 8 adds an optional token/guard).
+- **Dashboard "pressure" is not quota.** It is the share of observed failures
+  in the 24 h window that were capacity/429 or auth/quota. AIRoute cannot read
+  provider quota balances, and the UI says so.
 - **Remote:** `origin` → `https://github.com/oddball07/airoute.git`, `main` tracks it.
   Git identity is still `AIRoute Phase 0 <airoute@local>` unless changed.
 - Reasoning/cost reporting beyond `cost: {input:0, output:0}` is not implemented.
@@ -154,26 +175,30 @@ airoute install-opencode --project $tmp --url http://127.0.0.1:8799
   Late-2026 follow-up: write `agents.<defaultAgent>.model` (or document the
   manual edit) instead of the v1 root key.
 
-## 7. Next up (OpenCode only)
+## 7. Next up
 
-**Phase 5 is deferred** by the user (2026-11-09): no Claude Code / Anthropic
-adapter work until they ask. Keep the effort on OpenCode.
+**Phase 5 (Claude Code) and Phase 6 (WebSource) are deferred** by the user
+(2026-11-09). Phase 7 (dashboard) is done. **Phase 8 hardening is next**, then
+new free API sources (the user says "like openrouter" — OpenRouter is already
+connected; this means *additional providers*).
 
-Candidate next chunks, roughly in value order:
+Phase 8 scope, roughly in value order (confirm with the user before starting):
 
-1. **Install diagnostics**: `airoute doctor` (gateway reachable, config current,
-   aliases routable, keys present) and `install-opencode --check` (exit 1 when
-   the installed config is stale, for a pre-flight script).
-2. **Catalog/config sync**: free catalogs churn; re-running install is manual
-   today. Options: `install-opencode --watch`, a `serve` startup notice when the
-   installed config is stale, or a documented one-liner.
+1. **Account rotation** — several keys per source (`OPENROUTER_API_KEYS=k1,k2`,
+   per-source `accounts[]`), pick by per-key health, rotate on auth/429, never
+   log key material; surface per-account state in `status`/dashboard.
+2. **More free sources** — provider research first (Qwen/ModelScope, Google AI
+   Studio free tier, Groq, Cerebras, Mistral free, GitHub Models, …), then one
+   `Source` package each and catalog/install refresh. Free-only gate applies.
+3. **Full e2e suite** — promote `scripts/opencode-gate-gateway.mjs` into
+   `npm run e2e` (discovery → stream → multi-turn → tools → failover → cooling
+   skip) using a temp config and local OpenCode, pass/fail exit code.
+4. **Operational hardening** — dashboard loopback guard/optional token, probe
+   budget/cadence caps, `airoute doctor` + `install-opencode --check` for stale
+   configs, retention verification, documented catalog-churn runbook.
 
-Capability-aware routing (formerly item 1) shipped in Phase 4.5: tool requests
-skip `caps.tools: false` candidates, oversized prompts skip small-context
-candidates, and `install-opencode` derives alias capabilities/context from the
-alias's candidates.
-
-Re-run the Phase 3 gates (live + harness) after routing changes.
+Also still open from earlier: write `agents.<id>.model` instead of the ignored
+v2 root `model` key in the OpenCode installer.
 
 ## 8. Environment gotchas (learned the hard way)
 
@@ -205,14 +230,14 @@ Re-run the Phase 3 gates (live + harness) after routing changes.
 
 ## 10. Handoff checklist (fill in before starting the new session)
 
-- [ ] Last thing I was working on: ______
+- [x] Last thing I was working on: Phase 7 dashboard (done, live-checked)
 - [ ] Uncommitted changes: ______ (`git status --short`)
-- [ ] Decision waiting on the user: ______
-- [ ] Anything I tried that failed: ______
+- [x] Decision waiting on the user: Phase 8 scope (next action: connect new free sources)
+- [x] Anything I tried that failed: subagents unusable on exhausted free quota — assistant did the work directly
 
 ## 11. What to tell the new session
 
 > Read `HANDOFF.md` in `D:\tools\airoute` first, then run the §2 verification
-> commands. Continue from §7 (OpenCode-only queue) unless I say otherwise. Keep
-> the rules in §1: free models only, OpenCode first, no secrets in logs, offline
-> tests.
+> commands. Phase 7 is done; continue from §7 (Phase 8 hardening, then new free
+> API sources) unless I say otherwise. Keep the rules in §1: free models only,
+> OpenCode first, no secrets in logs, offline tests.

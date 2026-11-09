@@ -38,6 +38,13 @@ import {
   type HealthTracker,
   type Outcome,
 } from "@airoute/monitor";
+import {
+  DASHBOARD_PATH,
+  DASHBOARD_SNAPSHOT_PATH,
+  buildDashboardSnapshot,
+  renderDashboardPage,
+  type DashboardOptions,
+} from "./dashboard.js";
 
 /**
  * Upstream timeout window. Non-streaming calls treat it as a whole-request
@@ -69,6 +76,11 @@ export interface GatewayOptions {
    * order) by live health. Receives the alias name for profile tweaks.
    */
   ranker?: (candidates: readonly ModelSpec[], alias: string) => readonly ModelSpec[];
+  /**
+   * Phase 7 dashboard (`/dashboard`). Omit to keep the routes dark on a
+   * bare gateway; `airoute serve` always supplies it.
+   */
+  dashboard?: DashboardOptions;
 }
 
 export interface ServeOptions extends GatewayOptions {
@@ -215,6 +227,14 @@ async function handleRequest(
 
   if (path === "/healthz" && method === "GET") return void (await healthz(response, options));
   if (path === "/v1/models" && method === "GET") return void (await listModels(response, options));
+  if (path === DASHBOARD_PATH && method === "GET") {
+    sendHtml(response, renderDashboardPage());
+    return;
+  }
+  if (path === DASHBOARD_SNAPSHOT_PATH && method === "GET") {
+    await dashboardSnapshot(response, options, logger);
+    return;
+  }
   if (path === "/v1/chat/completions") {
     if (method !== "POST") {
       sendJson(response, 405, makeErrorBody("use POST for /v1/chat/completions", 405, "method_not_allowed"));
@@ -227,7 +247,7 @@ async function handleRequest(
     sendJson(response, 200, {
       name: "airoute",
       version: options.version ?? AIRROUTE_VERSION,
-      endpoints: ["/healthz", "/v1/models", "/v1/chat/completions"],
+      endpoints: ["/healthz", "/v1/models", "/v1/chat/completions", DASHBOARD_PATH],
     });
     return;
   }
@@ -266,6 +286,38 @@ function monitorSummary(health: HealthTracker): {
   const models = health.snapshot();
   for (const row of models) counts[row.state] = (counts[row.state] ?? 0) + 1;
   return { counts, models };
+}
+
+/**
+ * Dashboard JSON (Phase 7). Derives everything from the live registry, the
+ * breaker and the metrics store so the page cannot disagree with routing.
+ */
+async function dashboardSnapshot(
+  response: http.ServerResponse,
+  options: GatewayOptions,
+  logger: Logger,
+): Promise<void> {
+  try {
+    const specs = await options.registry.models();
+    const snapshot = buildDashboardSnapshot({
+      ...(options.dashboard ?? {}),
+      specs,
+      ...(options.aliasMap !== undefined ? { aliasMap: options.aliasMap } : {}),
+      ...(options.ranker !== undefined ? { ranker: options.ranker } : {}),
+      ...(options.health !== undefined ? { health: options.health } : {}),
+      version: options.version ?? AIRROUTE_VERSION,
+    });
+    sendJson(response, 200, snapshot);
+  } catch (err) {
+    logger.error("dashboard snapshot failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    sendJson(
+      response,
+      500,
+      makeErrorBody("dashboard snapshot failed", 500, "dashboard_error"),
+    );
+  }
 }
 
 async function listModels(response: http.ServerResponse, options: GatewayOptions): Promise<void> {
@@ -985,6 +1037,17 @@ function sendJson(response: http.ServerResponse, status: number, body: unknown):
     "content-length": Buffer.byteLength(JSON.stringify(body)),
   });
   response.end(JSON.stringify(body));
+}
+
+/** Send a UTF-8 HTML document (dashboard). */
+function sendHtml(response: http.ServerResponse, html: string): void {
+  response.writeHead(200, {
+    "content-type": "text/html; charset=utf-8",
+    "content-length": Buffer.byteLength(html),
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+  });
+  response.end(html);
 }
 
 async function readBody(

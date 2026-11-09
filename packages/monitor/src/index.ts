@@ -62,6 +62,8 @@ export {
   percentiles,
   statsWindowArgs,
   type BreakerStateUpsert,
+  type ActivityRow,
+  type FailureKindRow,
   type ModelStateRow,
   type ProbeObservation,
   type ProbeRunRow,
@@ -70,4 +72,5 @@ export {
   type RollupHourlyRow,
   type StatsSnapshot,
   type StatsWindow,
+  type UptimeBucketRow,
 } from "./store.js";

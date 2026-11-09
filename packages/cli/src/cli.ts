@@ -160,6 +160,7 @@ async function loadOrExit(
 async function runServe(options: Map<string, string | boolean>): Promise<void> {
   const logger = createLogger({ scope: "airoute" });
   const { config, configPath } = await loadOrExit(options, logger);
+  const startedAt = Date.now();
 
   let host = config.server.host;
   const hostOverride = stringOption(options, "host");
@@ -199,12 +200,19 @@ async function runServe(options: Map<string, string | boolean>): Promise<void> {
     aliasMap: config.aliases,
     health: monitor.health,
     ranker: monitor.ranker,
+    dashboard: {
+      store: monitor.store,
+      weights: config.rank.weights,
+      startedAt,
+      configPath,
+    },
     host,
     port,
     logger: logger.child("gateway"),
   });
   logger.info(`gateway listening at http://${gateway.host}:${gateway.port}`, {
-    endpoints: ["/healthz", "/v1/models", "/v1/chat/completions"],
+    endpoints: ["/healthz", "/v1/models", "/v1/chat/completions", "/dashboard"],
+    dashboard: `http://${gateway.host}:${gateway.port}/dashboard`,
   });
   // startGateway installs SIGINT/SIGTERM/SIGBREAK shutdown handlers by default.
 }

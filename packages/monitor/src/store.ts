@@ -148,6 +148,47 @@ export interface StatsWindow {
 }
 
 /**
+ * One (source, model, time-bucket) uptime row for the dashboard heatmap
+ * (Phase 7). Probe and request counts are merged into the same bucket.
+ */
+export interface UptimeBucketRow {
+  sourceId: string;
+  modelId: string;
+  /** Bucket index: `floor((ts - since) / bucketMs)`, `0` = oldest. */
+  bucket: number;
+  probes: number;
+  probeOks: number;
+  requests: number;
+  requestOks: number;
+}
+
+/** One recent probe/request event for the dashboard's live activity list. */
+export interface ActivityRow {
+  kind: "probe" | "request";
+  /** ms epoch. */
+  ts: number;
+  sourceId: string;
+  modelId: string;
+  /** Probes only: success flag. */
+  ok: boolean | null;
+  /** Requests only: passive outcome. */
+  outcome: Outcome | null;
+  /** Probe latency or request total time. */
+  latencyMs: number | null;
+  errorKind: ErrorKind | null;
+  /** Probe error detail when present. */
+  errorDetail: string | null;
+}
+
+/** Failure counts per (source, model, error kind) over a window. */
+export interface FailureKindRow {
+  sourceId: string;
+  modelId: string;
+  kind: ErrorKind;
+  count: number;
+}
+
+/**
  * Aggregate the rows described by `window` (convenience destructuring helper
  * for callers that keep StatsWindow params around, e.g. the Phase 2 ranker).
  */
@@ -195,6 +236,10 @@ export class MetricsStore {
     lastFailureProbe: StatementSync;
     lastFailureRequest: StatementSync;
     loadAllState: StatementSync;
+    probeBuckets: StatementSync;
+    requestBuckets: StatementSync;
+    recentActivity: StatementSync;
+    failureKinds: StatementSync;
   };
   #closed = false;
 
@@ -346,6 +391,37 @@ export class MetricsStore {
         `SELECT ts, COALESCE(error_kind, outcome) AS kind FROM request_events
          WHERE source_id = ? AND model_id = ? AND outcome != 'ok' AND outcome != 'drop'
          ORDER BY ts DESC, id DESC LIMIT 1`,
+      ),
+      probeBuckets: db.prepare(
+        `SELECT source_id, model_id, CAST((ts - ?1) / ?2 AS INTEGER) AS bucket,
+                COUNT(*) AS total, COALESCE(SUM(ok), 0) AS oks
+         FROM probe_runs WHERE ts > ?1
+         GROUP BY source_id, model_id, bucket`,
+      ),
+      requestBuckets: db.prepare(
+        `SELECT source_id, model_id, CAST((ts - ?1) / ?2 AS INTEGER) AS bucket,
+                COUNT(*) AS total, COALESCE(SUM(outcome = 'ok'), 0) AS oks
+         FROM request_events WHERE ts > ?1
+         GROUP BY source_id, model_id, bucket`,
+      ),
+      recentActivity: db.prepare(
+        `SELECT 'probe' AS kind, ts, source_id, model_id, ok, NULL AS outcome,
+                latency_ms, error_kind, error_detail
+         FROM probe_runs WHERE ts > ?1
+         UNION ALL
+         SELECT 'request', ts, source_id, model_id, NULL, outcome,
+                total_ms, error_kind, NULL
+         FROM request_events WHERE ts > ?1
+         ORDER BY ts DESC LIMIT ?2`,
+      ),
+      failureKinds: db.prepare(
+        `SELECT source_id, model_id, COALESCE(error_kind, 'unknown') AS kind, COUNT(*) AS count
+         FROM probe_runs WHERE ts > ?1 AND ok = 0
+         GROUP BY source_id, model_id, kind
+         UNION ALL
+         SELECT source_id, model_id, COALESCE(error_kind, outcome) AS kind, COUNT(*) AS count
+         FROM request_events WHERE ts > ?1 AND outcome != 'ok' AND outcome != 'drop'
+         GROUP BY source_id, model_id, kind`,
       ),
     };
   }
@@ -561,8 +637,101 @@ export class MetricsStore {
     }));
   }
 
-  /** Test/diagnostic helper: all `probe_runs` rows for one pair, newest first. */
-  probeRunsFor(sourceId: string, modelId: string, limit = 100): ProbeRunRow[] {
+  /**
+   * Uptime series for the dashboard heatmap (Phase 7): probe and request
+   * counts per `(source, model, bucket)` since `since`. Buckets are
+   * zero-based from `since`; callers clamp/discard out-of-range rows.
+   */
+  getUptimeBuckets(since: number, bucketMs: number): UptimeBucketRow[] {
+    this.#assertOpen();
+    const merged = new Map<string, UptimeBucketRow>();
+    const keyOf = (sourceId: string, modelId: string, bucket: number): string =>
+      `${sourceId}\u0000${modelId}\u0000${bucket}`;
+
+    const probeRows = this.#stmts.probeBuckets.all(since, bucketMs) as Array<
+      Record<string, unknown>
+    >;
+    for (const row of probeRows) {
+      const sourceId = String(row["source_id"]);
+      const modelId = String(row["model_id"]);
+      const bucket = Number(row["bucket"]);
+      merged.set(keyOf(sourceId, modelId, bucket), {
+        sourceId,
+        modelId,
+        bucket,
+        probes: Number(row["total"]),
+        probeOks: Number(row["oks"]),
+        requests: 0,
+        requestOks: 0,
+      });
+    }
+
+    const requestRows = this.#stmts.requestBuckets.all(since, bucketMs) as Array<
+      Record<string, unknown>
+    >;
+    for (const row of requestRows) {
+      const sourceId = String(row["source_id"]);
+      const modelId = String(row["model_id"]);
+      const bucket = Number(row["bucket"]);
+      const key = keyOf(sourceId, modelId, bucket);
+      const existing = merged.get(key);
+      if (existing === undefined) {
+        merged.set(key, {
+          sourceId,
+          modelId,
+          bucket,
+          probes: 0,
+          probeOks: 0,
+          requests: Number(row["total"]),
+          requestOks: Number(row["oks"]),
+        });
+      } else {
+        existing.requests = Number(row["total"]);
+        existing.requestOks = Number(row["oks"]);
+      }
+    }
+
+    return [...merged.values()].sort(
+      (a, b) =>
+        a.sourceId.localeCompare(b.sourceId) ||
+        a.modelId.localeCompare(b.modelId) ||
+        a.bucket - b.bucket,
+    );
+  }
+
+  /**
+   * Newest probe/request events since `since`, for the dashboard's live
+   * activity panel. `limit` is applied after ordering, so this stays cheap.
+   */
+  getRecentActivity(since: number, limit = 25): ActivityRow[] {
+    this.#assertOpen();
+    const rows = this.#stmts.recentActivity.all(since, limit) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      kind: row["kind"] === "probe" ? ("probe" as const) : ("request" as const),
+      ts: Number(row["ts"]),
+      sourceId: String(row["source_id"]),
+      modelId: String(row["model_id"]),
+      ok: row["ok"] === null || row["ok"] === undefined ? null : Number(row["ok"]) === 1,
+      outcome: (row["outcome"] as Outcome | null) ?? null,
+      latencyMs: row["latency_ms"] === null ? null : Number(row["latency_ms"]),
+      errorKind: (row["error_kind"] as ErrorKind | null) ?? null,
+      errorDetail: (row["error_detail"] as string | null) ?? null,
+    }));
+  }
+
+  /** Failure counts per `(source, model, error kind)` since `since`. */
+  getFailureKinds(since: number): FailureKindRow[] {
+    this.#assertOpen();
+    const rows = this.#stmts.failureKinds.all(since) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      sourceId: String(row["source_id"]),
+      modelId: String(row["model_id"]),
+      kind: String(row["kind"]) as ErrorKind,
+      count: Number(row["count"]),
+    }));
+  }
+
+  /** Test/diagnostic helper: all `probe_runs` rows for one pair, newest first. */  probeRunsFor(sourceId: string, modelId: string, limit = 100): ProbeRunRow[] {
     this.#assertOpen();
     const stmt = this.#db.prepare(
       `SELECT id, ts, source_id, model_id, ok, latency_ms, error_kind, error_detail, at
