@@ -275,6 +275,9 @@ scripts and future dashboards do not have to re-implement resolution.
   (logs go to stderr so stdout stays parseable). 274 offline tests; the Phase 3
   OpenCode gates were re-run against a live gateway and the deterministic
   harness.
+- **Phase 5 (deferred)** — Anthropic `/v1/messages` → Claude Code. Parked by
+  request (2026-11-09); OpenCode remains the only target. Next OpenCode work is
+  capability-aware routing, install diagnostics, and catalog/config sync.
 
 ### Z.AI (zai source)
 

@@ -140,15 +140,28 @@ airoute install-opencode --project $tmp --url http://127.0.0.1:8799
   Git identity is still `AIRoute Phase 0 <airoute@local>` unless changed.
 - Reasoning/cost reporting beyond `cost: {input:0, output:0}` is not implemented.
 
-## 7. Next up (Phase 5)
+## 7. Next up (OpenCode only)
 
-Phase 4 is done. Next is **Phase 5: Anthropic `/v1/messages` adapter** so Claude
-Code can use the same gateway (secondary CLI — keep OpenCode green first).
-Add it as a separate route translating Anthropic wire ⇄ IR, with tests, then
-run a manual Claude Code check in a scratch dir. The OpenCode plugin fallback
-remains unnecessary unless the config provider hits a wall.
+**Phase 5 is deferred** by the user (2026-11-09): no Claude Code / Anthropic
+adapter work until they ask. Keep the effort on OpenCode.
 
-Re-run the Phase 3 gates (live + harness) after any routing change.
+Candidate next chunks, roughly in value order:
+
+1. **Capability-aware routing** (real gap). The gateway never filters
+   candidates by `caps`/context. An OpenCode request with `tools` can currently
+   fail over onto a `tools: false` candidate — the live catalog even contains
+   audio-generation entries (`openrouter/google/lyria-*`). Fix: drop candidates
+   that cannot honour the request (tools, vision, usable context), return an
+   explained 503 when none remain, and stop advertising `tools: true` for every
+   alias in `install-opencode` (compute from candidates).
+2. **Install diagnostics**: `airoute doctor` (gateway reachable, config current,
+   aliases routable, keys present) and `install-opencode --check` (exit 1 when
+   the installed config is stale, for a pre-flight script).
+3. **Catalog/config sync**: free catalogs churn; re-running install is manual
+   today. Options: `install-opencode --watch`, a `serve` startup notice when the
+   installed config is stale, or a documented one-liner.
+
+Re-run the Phase 3 gates (live + harness) after routing changes.
 
 ## 8. Environment gotchas (learned the hard way)
 
