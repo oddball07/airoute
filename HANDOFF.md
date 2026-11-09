@@ -190,6 +190,9 @@ Phase 8 scope, roughly in value order (confirm with the user before starting):
 2. **More free sources** — provider research first (Qwen/ModelScope, Google AI
    Studio free tier, Groq, Cerebras, Mistral free, GitHub Models, …), then one
    `Source` package each and catalog/install refresh. Free-only gate applies.
+   Verified shortlist + endpoints + limits: `docs/free-providers.md` (checked
+   2026-11-09; GitHub Models is retired, Cerebras is trial-only, HF has no free
+   credits).
 3. **Full e2e suite** — promote `scripts/opencode-gate-gateway.mjs` into
    `npm run e2e` (discovery → stream → multi-turn → tools → failover → cooling
    skip) using a temp config and local OpenCode, pass/fail exit code.

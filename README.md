@@ -352,7 +352,8 @@ catalog-only snapshot (no metrics store attached).
   feed. 293 offline tests; live-checked against the 18-model catalog.
 - **Phase 8 (next)** — hardening: account rotation (multi-key sources), more
   free API sources, full OpenCode e2e suite as a command, and operational items
-  (dashboard guard, probe budget, `doctor` / stale-config check).
+  (dashboard guard, probe budget, `doctor` / stale-config check). Provider
+  shortlist with verified limits: `docs/free-providers.md`.
 
 ### Z.AI (zai source)
 
