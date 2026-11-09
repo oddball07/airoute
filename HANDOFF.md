@@ -146,6 +146,13 @@ airoute install-opencode --project $tmp --url http://127.0.0.1:8799
 - **Remote:** `origin` → `https://github.com/oddball07/airoute.git`, `main` tracks it.
   Git identity is still `AIRoute Phase 0 <airoute@local>` unless changed.
 - Reasoning/cost reporting beyond `cost: {input:0, output:0}` is not implemented.
+- **OpenCode v2 ignores the root `model` key** the installer writes. v2's config
+  schema uses `agents.<id>.model` (`"agents": { "orchestrator": { "model":
+  "airoute/free-best" } }`); `model`, `small_model` and `subagent_depth` are
+  dropped by v2. The provider block itself is fine, so `--model airoute/free-best`
+  and the TUI model picker work; only the "default model" attempt is a no-op.
+  Late-2026 follow-up: write `agents.<defaultAgent>.model` (or document the
+  manual edit) instead of the v1 root key.
 
 ## 7. Next up (OpenCode only)
 
