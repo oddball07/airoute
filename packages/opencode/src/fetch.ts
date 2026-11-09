@@ -8,11 +8,13 @@ import type { ModelSpec } from "@airoute/core";
 import { gatewayCatalogToSpecs, normalizeGatewayBaseUrl } from "./config.js";
 import { isRecord } from "./jsonc.js";
 
-/** What `install-opencode --url` needs: the free catalog plus alias names. */
+/** What `install-opencode --url` needs: the free catalog, alias names, alias wiring. */
 export interface GatewayCatalog {
   specs: ModelSpec[];
   /** Alias names declared by the gateway (empty when the payload has none). */
   aliases: string[];
+  /** Alias name → ordered candidate ids, from `alias_details` when present. */
+  aliasCandidates: Record<string, string[]>;
 }
 
 /**
@@ -42,7 +44,11 @@ export async function fetchGatewayCatalog(
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`gateway catalog: GET ${url} returned an unparseable body: ${message}`);
   }
-  return { specs: gatewayCatalogToSpecs(payload), aliases: parseGatewayAliases(payload) };
+  return {
+    specs: gatewayCatalogToSpecs(payload),
+    aliases: parseGatewayAliases(payload),
+    aliasCandidates: parseAliasCandidates(payload),
+  };
 }
 
 /** Alias names from a `/v1/models` payload; non-arrays and bad entries are ignored. */
@@ -51,4 +57,24 @@ function parseGatewayAliases(payload: unknown): string[] {
   const raw = payload["aliases"];
   if (!Array.isArray(raw)) return [];
   return raw.filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+/**
+ * Candidate ids per alias from `alias_details` (Phase 4). Missing or malformed
+ * details are ignored; the installer then falls back to generic alias metadata.
+ */
+function parseAliasCandidates(payload: unknown): Record<string, string[]> {
+  if (!isRecord(payload)) return {};
+  const details = payload["alias_details"];
+  if (!isRecord(details)) return {};
+  const out: Record<string, string[]> = {};
+  for (const [alias, value] of Object.entries(details)) {
+    if (!isRecord(value)) continue;
+    const candidates = value["candidates"];
+    if (!Array.isArray(candidates)) continue;
+    out[alias] = candidates.filter(
+      (id): id is string => typeof id === "string" && id.length > 0,
+    );
+  }
+  return out;
 }

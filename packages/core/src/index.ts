@@ -5,5 +5,6 @@ export * from "./version.js";
 export * from "./openai-wire.js";
 export * from "./registry.js";
 export * from "./router.js";
+export * from "./tokens.js";
 export * from "./config.js";
 export * from "./bootstrap.js";

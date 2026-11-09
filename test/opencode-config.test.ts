@@ -159,6 +159,59 @@ describe("buildAirouteProvider", () => {
     });
   });
 
+  it("derives alias capabilities/context from its candidates", () => {
+    const provider = buildAirouteProvider({
+      specs: [
+        spec({}, "zai/glm-4.5-flash"),
+        // Audio model: huge context, no tool calling.
+        spec(
+          {
+            label: "lyria",
+            caps: { tools: false, vision: false, reasoning: false },
+            contextWindow: 1_000_000,
+          },
+          "openrouter/google/lyria-3-pro-preview",
+        ),
+        spec({ contextWindow: 64_000 }, "tiny/chat"),
+      ],
+      aliases: ["free-fast", "audio-only"],
+      aliasCandidates: {
+        // Tools come from the candidates that support them...
+        "free-fast": ["zai/glm-4.5-flash", "tiny/chat"],
+        // ...and context is the largest candidate window.
+        "audio-only": ["openrouter/google/lyria-3-pro-preview"],
+      },
+      gatewayUrl: "http://127.0.0.1:8787",
+    });
+    const models = provider["models"] as Record<string, Record<string, unknown>>;
+    expect(models["free-fast"]).toEqual({
+      modelID: "free-fast",
+      name: "free-fast",
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+      limit: { context: 128_000 },
+    });
+    expect(models["audio-only"]).toEqual({
+      modelID: "audio-only",
+      name: "audio-only",
+      capabilities: { tools: false, input: ["text"], output: ["text"] },
+      limit: { context: 1_000_000 },
+    });
+  });
+
+  it("falls back to tools: true / 200k for an alias with no known candidates", () => {
+    const provider = buildAirouteProvider({
+      specs: [spec()],
+      aliases: ["free-best"],
+      aliasCandidates: { "free-best": ["gone/model"] },
+      gatewayUrl: "http://127.0.0.1:8787",
+    });
+    const models = provider["models"] as Record<string, Record<string, unknown>>;
+    expect(models["free-best"]).toMatchObject({
+      capabilities: { tools: true },
+      limit: { context: 200_000 },
+    });
+  });
+
   it("reflects caps: no reasoning key, image input for vision, no limit for 0 context", () => {
     const provider = buildAirouteProvider({
       specs: [spec({ label: "", caps: { tools: false, vision: true, reasoning: false }, contextWindow: 0 }, "x/v")],

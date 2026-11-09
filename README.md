@@ -170,6 +170,34 @@ whose candidates are all unhealthy gets `503 all_candidates_unavailable` with
 `details.candidates: [{ model, state, retry_in_ms? }]`, so callers can see why
 and for how long.
 
+**Candidates are capability-filtered** (Phase 4.5). Before ranking/failover the
+gateway drops candidates that cannot honour the request, keeping ranked order:
+
+- **Tools** — a request with a non-empty `tools` array never lands on a model
+  with `caps.tools: false` (the live catalog contains tool-less audio models
+  such as `openrouter/google/lyria-*`).
+- **Context** — the prompt is estimated at `chars / 4` (`estimateRequestTokens`)
+  plus `max_tokens`; candidates whose `contextWindow` is smaller are skipped.
+  The estimate is deliberately coarse and only ever *skips* a candidate when the
+  prompt clearly cannot fit — otherwise the upstream's own error is passed
+  through unchanged.
+
+When nothing survives the filter the response explains each rejection:
+
+- exact model id that cannot do what was asked → `400 model_incompatible`
+  (`model "…" does not support tool calling` / `… context too small …`);
+- an alias where no candidate qualifies → `503 no_compatible_candidate`;
+- mixed health + capability failures → `503 all_candidates_unavailable`.
+
+Both carry `details.candidates: [{ model, reason, state?, retry_in_ms?,
+context_window?, estimated_prompt_tokens? }]`.
+
+`install-opencode` uses the same candidate lists to write honest alias metadata:
+`capabilities.tools` is true only when at least one candidate supports tools,
+and `limit.context` is the largest candidate context window (200k only when the
+candidates are unknown). Previously every alias claimed `tools: true` with a
+200k limit regardless of what it could actually route to.
+
 **No auth in Phase 0/1** — the gateway binds `127.0.0.1` and is meant for local
 use. The 120 s upstream timeout (`AbortController`, `requestTimeoutMs`) is a
 whole-request deadline for non-streaming calls and an **idle** deadline for
@@ -275,9 +303,16 @@ scripts and future dashboards do not have to re-implement resolution.
   (logs go to stderr so stdout stays parseable). 274 offline tests; the Phase 3
   OpenCode gates were re-run against a live gateway and the deterministic
   harness.
+- **Phase 4.5 (done)** — capability-aware routing: candidates are filtered by
+  source availability → breaker health → `caps.tools` → estimated context fit;
+  `400 model_incompatible` and `503 no_compatible_candidate` explain each
+  rejection, and `install-opencode` derives alias `capabilities.tools` /
+  `limit.context` from the alias's real candidates. 283 offline tests; live
+  tool request routed to a tool-capable model, explicit tool-less model rejected
+  with 400, and the Phase 3 gates re-run green.
 - **Phase 5 (deferred)** — Anthropic `/v1/messages` → Claude Code. Parked by
   request (2026-11-09); OpenCode remains the only target. Next OpenCode work is
-  capability-aware routing, install diagnostics, and catalog/config sync.
+  install diagnostics (`doctor`, `--check`) and catalog/config sync.
 
 ### Z.AI (zai source)
 

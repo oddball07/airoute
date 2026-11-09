@@ -38,6 +38,26 @@ describe("fetchGatewayCatalog", () => {
     const catalog = await fetchGatewayCatalog("http://127.0.0.1:8787", impl);
     expect(catalog.specs).toEqual([]);
     expect(catalog.aliases).toEqual([]);
+    expect(catalog.aliasCandidates).toEqual({});
+  });
+
+  it("parses alias_details candidates and ignores malformed entries", async () => {
+    const payload = {
+      data: [],
+      aliases: ["free-best", "free-fast"],
+      alias_details: {
+        "free-best": {
+          mode: "auto",
+          fallback: false,
+          candidates: ["zai/glm-4.5-flash", 42, ""],
+        },
+        "free-fast": { mode: "explicit", candidates: "nope" },
+        broken: null,
+      },
+    };
+    const { impl } = fakeFetch(payload);
+    const catalog = await fetchGatewayCatalog("http://127.0.0.1:8787", impl);
+    expect(catalog.aliasCandidates).toEqual({ "free-best": ["zai/glm-4.5-flash"] });
   });
 
   it("normalizes a /v1-suffixed base URL without double-appending", async () => {

@@ -18,6 +18,7 @@ import {
   DEFAULT_MONITOR,
   buildRegistry,
   createLogger,
+  describeAliases,
   loadConfig,
   type AirouteConfig,
   type Logger,
@@ -408,10 +409,12 @@ async function runInstallOpencode(options: Map<string, string | boolean>): Promi
   let specs: ModelSpec[];
   let gatewayUrl: string;
   let gatewayAliases: string[] = [];
+  let aliasCandidates: Record<string, readonly string[]> = {};
   if (url !== undefined && url.length > 0) {
     const catalog = await fetchGatewayCatalog(url);
     specs = catalog.specs;
     gatewayAliases = catalog.aliases;
+    aliasCandidates = catalog.aliasCandidates;
     gatewayUrl = url;
   } else {
     // `0.0.0.0`/`::` are bind-anywhere addresses; clients must connect via
@@ -423,6 +426,9 @@ async function runInstallOpencode(options: Map<string, string | boolean>): Promi
       logger: logger.child("sources"),
     });
     specs = await build.registry.models();
+    for (const description of describeAliases(specs, config.aliases)) {
+      aliasCandidates[description.alias] = description.candidates;
+    }
   }
 
   // A remote gateway's own aliases (served by /v1/models) plus the local
@@ -436,6 +442,7 @@ async function runInstallOpencode(options: Map<string, string | boolean>): Promi
     configPath: target,
     specs,
     aliases,
+    aliasCandidates,
     gatewayUrl,
     ...modelArg,
     dryRun,

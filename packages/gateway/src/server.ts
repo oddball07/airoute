@@ -18,6 +18,7 @@ import {
   closestModelIds,
   createLogger,
   describeAliases,
+  estimateRequestTokens,
   irChunkToOpenAIChunk,
   makeErrorBody,
   openAIRequestToIR,
@@ -398,45 +399,98 @@ async function chatCompletions(
     return;
   }
 
-  // Health filter (cooling/down) + source availability, preserving rank order.
+  // Candidate filter, preserving rank order:
+  // 1. source availability
+  // 2. circuit breaker (cooling/down)
+  // 3. capability match — a tool request must not land on a tool-less model
+  // 4. context fit — best-effort token estimate (see `estimateRequestTokens`)
+  const needsTools = (irRequest.tools?.length ?? 0) > 0;
+  const estimatedTokens = estimateRequestTokens(irRequest);
+  const requiredContext = estimatedTokens + (irRequest.max_tokens ?? 0);
   const candidates: Array<{ spec: ModelSpec; source: Source }> = [];
-  let hiddenByHealth = 0;
+  const unavailable: Array<Record<string, unknown> & { model: string; reason: string }> = [];
   for (const spec of freeCandidates) {
     const source = options.registry.get(spec.sourceId);
-    if (source === undefined) continue;
+    if (source === undefined) {
+      unavailable.push({ model: spec.id, reason: "source_unavailable" });
+      continue;
+    }
     if (options.health !== undefined && !options.health.isRoutable(spec.sourceId, spec.id)) {
-      hiddenByHealth += 1;
+      const state = options.health.state(spec.sourceId, spec.id);
+      const retryAt = options.health.cooldownExpiresAt(spec.sourceId, spec.id);
+      const retryIn = retryAt > Date.now() ? retryAt - Date.now() : 0;
+      unavailable.push({
+        model: spec.id,
+        reason: "unhealthy",
+        state,
+        ...(retryIn > 0 ? { retry_in_ms: retryIn } : {}),
+      });
+      continue;
+    }
+    if (needsTools && !spec.caps.tools) {
+      unavailable.push({ model: spec.id, reason: "tools_unsupported" });
+      continue;
+    }
+    if (requiredContext > 0 && spec.contextWindow > 0 && requiredContext > spec.contextWindow) {
+      unavailable.push({
+        model: spec.id,
+        reason: "context_too_small",
+        context_window: spec.contextWindow,
+        estimated_prompt_tokens: estimatedTokens,
+      });
       continue;
     }
     candidates.push({ spec, source });
   }
   if (candidates.length === 0) {
-    // Explain *why*: which candidates exist, what state each is in, and how
-    // long a cooling model needs. Without this a 503 is indistinguishable from
-    // a misconfiguration for the user staring at `airoute/…` in their CLI.
-    const blocked = freeCandidates.map((spec) => {
-      const sourceMissing = options.registry.get(spec.sourceId) === undefined;
-      const state = sourceMissing ? "source_unavailable" : options.health?.state(spec.sourceId, spec.id) ?? "healthy";
-      const retryAt = sourceMissing ? 0 : options.health?.cooldownExpiresAt(spec.sourceId, spec.id) ?? 0;
-      const retryIn = retryAt > Date.now() ? retryAt - Date.now() : 0;
-      return { model: spec.id, state, ...(retryIn > 0 ? { retry_in_ms: retryIn } : {}) };
-    });
-    const reason =
-      hiddenByHealth > 0
-        ? `every candidate for "${irRequest.model}" is cooling down or down`
-        : `no enabled source backs a candidate for "${irRequest.model}"`;
-    const shown = blocked
+    // Explain *why* each candidate was rejected: health state + retry window,
+    // missing tool support, or a context window that cannot hold the prompt.
+    const shown = unavailable
       .slice(0, 3)
-      .map((entry) => `${entry.model}: ${entry.state}`)
+      .map((entry) => `${entry["model"]}: ${entry["reason"] === "unhealthy" ? entry["state"] : entry["reason"]}`)
       .join(", ");
-    const detail = blocked.length > 0 ? ` (${shown}${blocked.length > 3 ? ", …" : ""})` : "";
+    const detail = unavailable.length > 0 ? ` (${shown}${unavailable.length > 3 ? ", …" : ""})` : "";
+    const capabilityOnly = unavailable.every(
+      (entry) => entry.reason === "tools_unsupported" || entry.reason === "context_too_small",
+    );
+    const hasHealth = unavailable.some((entry) => entry.reason === "unhealthy");
+
+    if (resolution.kind === "exact" && capabilityOnly) {
+      const [first] = unavailable;
+      const why =
+        first?.reason === "tools_unsupported"
+          ? `does not support tool calling`
+          : `has a ${String(first?.["context_window"] ?? 0)}-token context, too small for this request (~${estimatedTokens} tokens)`;
+      sendJson(
+        response,
+        400,
+        makeErrorBody(`model "${irRequest.model}" ${why}`, 400, "model_incompatible", {
+          requested: irRequest.model,
+          estimated_prompt_tokens: estimatedTokens,
+          candidates: unavailable,
+        }),
+      );
+      return;
+    }
+
+    const reason = hasHealth
+      ? `no candidate for "${irRequest.model}" is routable right now`
+      : capabilityOnly
+        ? `no candidate for "${irRequest.model}" matches the request requirements`
+        : `no enabled source backs a candidate for "${irRequest.model}"`;
     sendJson(
       response,
       503,
-      makeErrorBody(`${reason}${detail}; try again later`, 503, "all_candidates_unavailable", {
-        requested: irRequest.model,
-        candidates: blocked,
-      }),
+      makeErrorBody(
+        `${reason}${detail}; try again later`,
+        503,
+        capabilityOnly ? "no_compatible_candidate" : "all_candidates_unavailable",
+        {
+          requested: irRequest.model,
+          estimated_prompt_tokens: estimatedTokens,
+          candidates: unavailable,
+        },
+      ),
     );
     return;
   }

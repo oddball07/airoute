@@ -205,7 +205,7 @@ describe("alias-aware routing errors", () => {
       };
     };
     expect(body.error.code).toBe("all_candidates_unavailable");
-    expect(body.error.message).toContain("cooling down or down");
+    expect(body.error.message).toContain("no candidate");
     expect(body.error.message).toContain("a/basic: cooling");
     const candidate = body.error.details?.candidates?.[0];
     expect(candidate?.model).toBe("a/basic");

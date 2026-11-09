@@ -17,7 +17,7 @@ const OPENCODE_SCHEMA = "https://opencode.ai/config.json";
 export const AIROUTE_PROVIDER_ID = "airoute";
 /** Default alias used as the OpenCode default model when none is requested. */
 export const DEFAULT_OPENCODE_MODEL = "free-best";
-/** Context limit written for alias entries (aliases rank across models). */
+/** Fallback context limit for alias entries when no candidate is known. */
 const ALIAS_CONTEXT_LIMIT = 200_000;
 
 export interface BuildOpencodeConfigOptions {
@@ -29,6 +29,12 @@ export interface BuildOpencodeConfigOptions {
   gatewayUrl: string;
   /** Alias or gateway model id for the root `model` key. Default `free-best`. */
   defaultModel?: string;
+  /**
+   * Alias name → ordered candidate model ids (from `describeAliases` locally or
+   * `alias_details` over HTTP). Used to advertise honest per-alias capabilities
+   * and context instead of assuming every alias does tools with 200k context.
+   */
+  aliasCandidates?: Readonly<Record<string, readonly string[]>>;
 }
 
 /** The OpenCode JSON schema version we emit. */
@@ -146,15 +152,20 @@ function assertFree(spec: ModelSpec): void {
 
 /** Build just the `providers.airoute` block. Stable key order, idempotent. */
 export function buildAirouteProvider(
-  options: Pick<BuildOpencodeConfigOptions, "specs" | "aliases" | "gatewayUrl">,
+  options: Pick<BuildOpencodeConfigOptions, "specs" | "aliases" | "gatewayUrl" | "aliasCandidates">,
 ): Record<string, unknown> {
   const models: Record<string, unknown> = {};
+  const byId = new Map(options.specs.map((spec) => [spec.id, spec] as const));
   for (const spec of options.specs) {
     assertFree(spec);
     models[spec.id] = modelEntry(spec);
   }
   for (const alias of options.aliases) {
-    models[alias] = aliasEntry(alias);
+    const candidateIds = options.aliasCandidates?.[alias] ?? [];
+    const candidates = candidateIds
+      .map((id) => byId.get(id))
+      .filter((spec): spec is ModelSpec => spec !== undefined && spec.free === true);
+    models[alias] = aliasEntry(alias, candidates);
   }
   return {
     name: "AIRoute",
@@ -187,12 +198,25 @@ function modelEntry(spec: ModelSpec): Record<string, unknown> {
   return entry;
 }
 
-function aliasEntry(alias: string): Record<string, unknown> {
+/**
+ * Alias entry: an alias is only as capable as its candidates.
+ *
+ * - `tools` is true when at least one candidate supports tools. Routing also
+ *   filters tool requests, so a `true` here is safe (it never picks a tool-less
+ *   model); `false` tells OpenCode not to offer the agent's toolset at all.
+ * - `limit.context` is the largest candidate context, because a request that
+ *   needs more is filtered at routing time (with an explained 503) rather than
+ *   silently sent to a smaller model.
+ */
+function aliasEntry(alias: string, candidates: readonly ModelSpec[]): Record<string, unknown> {
+  const supportsTools = candidates.length === 0 ? true : candidates.some((spec) => spec.caps.tools);
+  const contexts = candidates.map((spec) => spec.contextWindow).filter((value) => value > 0);
+  const context = contexts.length > 0 ? Math.max(...contexts) : ALIAS_CONTEXT_LIMIT;
   return {
     modelID: alias,
     name: alias,
-    capabilities: { tools: true, input: ["text"], output: ["text"] },
-    limit: { context: ALIAS_CONTEXT_LIMIT },
+    capabilities: { tools: supportsTools, input: ["text"], output: ["text"] },
+    limit: { context },
   };
 }
 

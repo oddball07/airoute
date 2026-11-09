@@ -37,10 +37,10 @@ CLI agent (OpenCode) ──▶ airoute: POST /v1/chat/completions ──▶ sour
 
 ```powershell
 cd D:\tools\airoute
-git log --oneline -3      # expect ccce547 (phase3) at the tip, or newer
+git log --oneline -3      # expect the Phase 4.5 commit at the tip, or newer
 git status --short        # should be clean
 npm run build             # tsc -b, must be clean
-npm test                  # vitest run — 274 tests / 25 files, all offline
+npm test                  # vitest run - 283 tests / 26 files, all offline
 ```
 
 If the test count is lower than expected, stop and find out what was reverted
@@ -50,11 +50,11 @@ before continuing.
 
 | Path | What lives there |
 | --- | --- |
-| `packages/core` | IR types, OpenAI wire mappers, source registry, router, config loader, logger, errors |
-| `packages/gateway` | HTTP server: `/healthz`, `/v1/models`, `/v1/chat/completions` (SSE + non-stream) |
+| `packages/core` | IR types, OpenAI wire mappers, source registry, router, tokens (`estimateRequestTokens`), config loader, logger, errors |
+| `packages/gateway` | HTTP server: `/healthz`, `/v1/models`, `/v1/chat/completions` (SSE + non-stream); capability-aware candidate filter |
 | `packages/monitor` | SQLite metrics store (`node:sqlite`), probe scheduler, circuit breaker, ranker |
-| `packages/opencode` | OpenCode V2 custom-provider config builder + atomic installer + JSONC parser |
-| `packages/cli` | `serve`, `models`, `status`, `install-opencode` |
+| `packages/opencode` | OpenCode V2 custom-provider config builder (honest alias metadata) + atomic installer + JSONC parser |
+| `packages/cli` | `serve`, `models`, `status`, `install-opencode` (+ `alias-view`) |
 | `packages/sources/openai-compat` | shared kit: request building, SSE parsing, tool-call accumulation |
 | `packages/sources/zai`, `packages/sources/openrouter` | concrete free-tier sources |
 | `e2e/mock-provider` | deterministic fake provider + mock `Source` used by tests |
@@ -110,6 +110,13 @@ Providers exposed by the gateway: `zai/*`, `openrouter/*`, plus aliases
   routing errors (`alias_unavailable`, `all_candidates_unavailable` with
   per-candidate state/retry), alias tables in `models`/`status`, `--json` for
   both. 274 tests; Phase 3 gates re-run green (live + harness).
+- **Phase 4.5 (done)** — capability-aware routing: filter by source → breaker →
+  `caps.tools` → estimated context (`chars/4`); `400 model_incompatible` for an
+  exact model that cannot comply, `503 no_compatible_candidate` when no alias
+  candidate fits, each rejection explained in `details.candidates`. Aliases
+  installed into OpenCode now carry honest `capabilities.tools` and
+  `limit.context` derived from their candidates. 283 tests; live tool call
+  routed to a tools-capable model, tool-less model 400s, gates green.
 
 Phase 3 gates that were actually run green against real OpenCode:
 
@@ -147,19 +154,17 @@ adapter work until they ask. Keep the effort on OpenCode.
 
 Candidate next chunks, roughly in value order:
 
-1. **Capability-aware routing** (real gap). The gateway never filters
-   candidates by `caps`/context. An OpenCode request with `tools` can currently
-   fail over onto a `tools: false` candidate — the live catalog even contains
-   audio-generation entries (`openrouter/google/lyria-*`). Fix: drop candidates
-   that cannot honour the request (tools, vision, usable context), return an
-   explained 503 when none remain, and stop advertising `tools: true` for every
-   alias in `install-opencode` (compute from candidates).
-2. **Install diagnostics**: `airoute doctor` (gateway reachable, config current,
+1. **Install diagnostics**: `airoute doctor` (gateway reachable, config current,
    aliases routable, keys present) and `install-opencode --check` (exit 1 when
    the installed config is stale, for a pre-flight script).
-3. **Catalog/config sync**: free catalogs churn; re-running install is manual
+2. **Catalog/config sync**: free catalogs churn; re-running install is manual
    today. Options: `install-opencode --watch`, a `serve` startup notice when the
    installed config is stale, or a documented one-liner.
+
+Capability-aware routing (formerly item 1) shipped in Phase 4.5: tool requests
+skip `caps.tools: false` candidates, oversized prompts skip small-context
+candidates, and `install-opencode` derives alias capabilities/context from the
+alias's candidates.
 
 Re-run the Phase 3 gates (live + harness) after routing changes.
 
@@ -201,5 +206,6 @@ Re-run the Phase 3 gates (live + harness) after routing changes.
 ## 11. What to tell the new session
 
 > Read `HANDOFF.md` in `D:\tools\airoute` first, then run the §2 verification
-> commands. Continue from §7 (Phase 4) unless I say otherwise. Keep the rules in
-> §1: free models only, OpenCode first, no secrets in logs, offline tests.
+> commands. Continue from §7 (OpenCode-only queue) unless I say otherwise. Keep
+> the rules in §1: free models only, OpenCode first, no secrets in logs, offline
+> tests.
