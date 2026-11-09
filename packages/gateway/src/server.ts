@@ -17,6 +17,7 @@ import {
   ValidationError,
   closestModelIds,
   createLogger,
+  describeAliases,
   irChunkToOpenAIChunk,
   makeErrorBody,
   openAIRequestToIR,
@@ -268,12 +269,33 @@ function monitorSummary(health: HealthTracker): {
 
 async function listModels(response: http.ServerResponse, options: GatewayOptions): Promise<void> {
   const specs = await options.registry.models();
+  const aliasMap = options.aliasMap ?? {};
   // Alias names are part of the install contract: `airoute install-opencode
-  // --url` writes exactly these selectable `airoute/<alias>` entries.
-  const aliases = Object.keys(options.aliasMap ?? {});
+  // --url` writes exactly these selectable `airoute/<alias>` entries. The
+  // `alias_details` map is additive (Phase 4) and only describes what each
+  // alias currently routes to, so existing clients are unaffected.
+  const aliasNames = Object.keys(aliasMap);
+  const descriptions =
+    aliasNames.length > 0
+      ? describeAliases(specs, aliasMap, options.ranker !== undefined ? { rankCandidates: options.ranker } : {})
+      : [];
   sendJson(response, 200, {
     object: "list",
-    ...(aliases.length > 0 ? { aliases } : {}),
+    ...(aliasNames.length > 0 ? { aliases: aliasNames } : {}),
+    ...(descriptions.length > 0
+      ? {
+          alias_details: Object.fromEntries(
+            descriptions.map((description) => [
+              description.alias,
+              {
+                mode: description.mode,
+                fallback: description.fallback,
+                candidates: description.candidates,
+              },
+            ]),
+          ),
+        }
+      : {}),
     data: specs.map((spec) => ({
       id: spec.id,
       object: "model",
@@ -338,7 +360,23 @@ async function chatCompletions(
     ...(options.ranker !== undefined ? { rankCandidates: options.ranker } : {}),
   });
   if (resolution.kind === "unknown") {
-    sendUnknownModel(response, irRequest.model, specs);
+    // A configured alias with zero candidates is a different failure from a
+    // typo: say so instead of "model not found" (alias names are still listed
+    // in the details for discoverability).
+    if (options.aliasMap?.[irRequest.model] !== undefined) {
+      sendJson(
+        response,
+        503,
+        makeErrorBody(
+          `alias "${irRequest.model}" is configured but has no available candidates; enable a free source or fix the alias bucket`,
+          503,
+          "alias_unavailable",
+          { alias: irRequest.model, declared: options.aliasMap[irRequest.model] ?? [] },
+        ),
+      );
+      return;
+    }
+    sendUnknownModel(response, irRequest.model, specs, Object.keys(options.aliasMap ?? {}));
     return;
   }
 
@@ -373,11 +411,33 @@ async function chatCompletions(
     candidates.push({ spec, source });
   }
   if (candidates.length === 0) {
+    // Explain *why*: which candidates exist, what state each is in, and how
+    // long a cooling model needs. Without this a 503 is indistinguishable from
+    // a misconfiguration for the user staring at `airoute/…` in their CLI.
+    const blocked = freeCandidates.map((spec) => {
+      const sourceMissing = options.registry.get(spec.sourceId) === undefined;
+      const state = sourceMissing ? "source_unavailable" : options.health?.state(spec.sourceId, spec.id) ?? "healthy";
+      const retryAt = sourceMissing ? 0 : options.health?.cooldownExpiresAt(spec.sourceId, spec.id) ?? 0;
+      const retryIn = retryAt > Date.now() ? retryAt - Date.now() : 0;
+      return { model: spec.id, state, ...(retryIn > 0 ? { retry_in_ms: retryIn } : {}) };
+    });
     const reason =
       hiddenByHealth > 0
         ? `every candidate for "${irRequest.model}" is cooling down or down`
         : `no enabled source backs a candidate for "${irRequest.model}"`;
-    sendJson(response, 503, makeErrorBody(`${reason}; try again later`, 503, "all_candidates_unavailable"));
+    const shown = blocked
+      .slice(0, 3)
+      .map((entry) => `${entry.model}: ${entry.state}`)
+      .join(", ");
+    const detail = blocked.length > 0 ? ` (${shown}${blocked.length > 3 ? ", …" : ""})` : "";
+    sendJson(
+      response,
+      503,
+      makeErrorBody(`${reason}${detail}; try again later`, 503, "all_candidates_unavailable", {
+        requested: irRequest.model,
+        candidates: blocked,
+      }),
+    );
     return;
   }
 
@@ -518,16 +578,26 @@ function sendUnknownModel(
   response: http.ServerResponse,
   requested: string,
   specs: readonly ModelSpec[],
+  aliases: readonly string[] = [],
 ): void {
   const ids = specs.map((spec) => spec.id);
-  const suggestions = closestModelIds(requested, ids);
+  const suggestions = closestModelIds(requested, [...ids, ...aliases]);
   const hints =
     suggestions.length > 0 ? ` did you mean: ${suggestions.join(", ")}?` : "";
-  const available = ids.length > 0 ? ` available: ${ids.join(", ")}` : " (no free models are currently enabled)";
+  // Keep the 404 readable: the full catalog stays in `details.available`.
+  const shown = ids.slice(0, 8);
+  const available =
+    ids.length > 0
+      ? ` available models: ${shown.join(", ")}${ids.length > shown.length ? `, … (${ids.length} total)` : ""}`
+      : " (no free models are currently enabled)";
+  const aliasNote = aliases.length > 0 ? `; aliases: ${aliases.join(", ")}` : "";
   sendJson(
     response,
     404,
-    makeErrorBody(`model "${requested}" not found.${hints}${available}`, 404, "model_not_found"),
+    makeErrorBody(`model "${requested}" not found.${hints}${available}${aliasNote}`, 404, "model_not_found", {
+      available: ids,
+      aliases,
+    }),
   );
 }
 

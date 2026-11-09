@@ -48,8 +48,8 @@ startup with a `source 'x' disabled: no key` log — never a crash.
 
 ```bash
 airoute serve [--port N] [--host H] [--config PATH]
-airoute models [--config PATH]   # table: model id, source, context window, aliases
-airoute status [--config PATH]   # ranked free models with breaker state + uptime
+airoute models [--config PATH] [--json]   # free catalog + alias resolution
+airoute status [--config PATH] [--json]   # ranked models + alias health
 
 airoute install-opencode [--project [DIR]] [--config PATH] [--url URL] [--model NAME] [--dry-run]
 # write/merge providers.airoute into an OpenCode config (global by default,
@@ -138,11 +138,23 @@ editable per-deployment):
 | Endpoint | Notes |
 | --- | --- |
 | `GET /healthz` | `{ ok: true, sources: [{id, modelCount}], monitor?: { counts, models }, version }` |
-| `GET /v1/models` | aggregated free-model catalog, OpenAI-shaped; a top-level `aliases` array lists alias names |
+| `GET /v1/models` | aggregated free-model catalog, OpenAI-shaped; a top-level `aliases` array lists alias names and `alias_details` says where each alias routes |
 | `POST /v1/chat/completions` | OpenAI wire in/out; `stream: true` → SSE (`data: {...}` / `data: [DONE]`), flushed per chunk |
 
 The `/v1/models` `aliases` field is what lets `install-opencode --url` expose a
-remote gateway's aliases without a local config.
+remote gateway's aliases without a local config. `alias_details` is additive and
+describes the current resolution:
+
+```json
+"aliases": ["free-best", "free-coder"],
+"alias_details": {
+  "free-best": { "mode": "auto", "fallback": false, "candidates": ["zai/glm-4.5-flash", "..."] }
+}
+```
+
+`mode` is `explicit` (config listed models), `auto` (empty bucket → whole
+catalog, ranked), or `shadowed` (a model id has the alias's name). `fallback`
+means a non-empty bucket resolved to nothing and the catalog was used instead.
 
 **Tool calling** works in both modes: `tools` / `tool_choice` are forwarded
 upstream, streaming responses emit `delta.tool_calls` (arguments concatenated per
@@ -150,6 +162,13 @@ call `index`), and non-streaming responses return
 `choices[0].message.tool_calls` with `finish_reason: "tool_calls"`. Assistant
 `tool_calls` and `tool` role messages round-trip through the IR, so multi-step
 agent loops work.
+
+**Routing errors are alias-aware** (Phase 4). A typo gets `404 model_not_found`
+with did-you-mean hints that include aliases, plus `details.aliases`; a
+configured alias with no candidates gets `503 alias_unavailable`; and an alias
+whose candidates are all unhealthy gets `503 all_candidates_unavailable` with
+`details.candidates: [{ model, state, retry_in_ms? }]`, so callers can see why
+and for how long.
 
 **No auth in Phase 0/1** — the gateway binds `127.0.0.1` and is meant for local
 use. The 120 s upstream timeout (`AbortController`, `requestTimeoutMs`) is a
@@ -196,6 +215,36 @@ probe scheduler per enabled source (unless `monitor.enabled` is false).
   window and capability flags. `airoute status` prints the ranked table and
   the best candidate for each alias.
 
+## Aliases (Phase 4)
+
+Aliases are the stable names agents should use; models move, aliases don't.
+The shipped config declares `free-best`, `free-coder` and `free-fast`.
+
+- **Empty bucket** (`"free-best": []`) means "the whole free catalog", ranked
+  per request, with `free-coder`/`free-fast` weighting tool support/latency
+  more heavily. This is why the defaults work with no maintenance.
+- **Explicit bucket** (`"pinned": ["zai/glm-4.5-flash", "openrouter/x:free"]`)
+  restricts routing to those ids in that order (still health-ranked), so it is
+  a preference list, not a hard pin.
+- **Disappearing ids**: a non-empty bucket whose ids have all vanished falls
+  back to the catalog and is reported as `auto (fallback)` — visible rather
+  than silently empty.
+- **Shadowing**: an alias whose name equals a real model id is reported as
+  `shadowed`; the exact model id wins at routing time.
+
+```text
+aliases:
+  ALIAS       MODE  BEST                                             CANDIDATES
+  -----------------------------------------------------------------------------
+  free-best   auto  zai/glm-4.5-flash                                18 ready
+  free-coder  auto  openrouter/dots-studio/dots-3-note-preview:free  18 ready
+```
+
+`airoute models` shows catalog + alias wiring (`--json` for tooling);
+`airoute status` adds live health per alias (`18 ready`, `2 cooling`, retry
+hints) and `--json` emits `{ models, aliases }` with per-candidate state, so
+scripts and future dashboards do not have to re-implement resolution.
+
 ## Phase status
 
 - **Phase 0 (done)** — skeleton, types, registry, router, streaming gateway,
@@ -219,6 +268,13 @@ probe scheduler per enabled source (unless `monitor.enabled` is false).
   deterministic gate harness (`scripts/opencode-gate-gateway.mjs`): discovery,
   streaming + multi-turn context, tool calls, failover on a 429 first
   candidate, and skipping a cooling model. 256 offline tests.
+- **Phase 4 (done)** — alias UX: `/v1/models` `alias_details` (mode/fallback/
+  ranked candidates), alias-aware 404 hints and `503 alias_unavailable` /
+  `all_candidates_unavailable` with per-candidate health and retry windows,
+  alias sections in `airoute models` / `airoute status`, and `--json` for both
+  (logs go to stderr so stdout stays parseable). 274 offline tests; the Phase 3
+  OpenCode gates were re-run against a live gateway and the deterministic
+  harness.
 
 ### Z.AI (zai source)
 

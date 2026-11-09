@@ -115,6 +115,65 @@ export function resolveModelFromSpecs(
     : { kind: "alias", spec: first };
 }
 
+/** How an alias obtained its candidate list. */
+export type AliasMode = "explicit" | "auto" | "shadowed";
+
+/** Human/tooling-facing description of one configured alias. */
+export interface AliasDescription {
+  alias: string;
+  /**
+   * `explicit` — the config bucket listed at least one model that exists.
+   * `auto`     — empty bucket (or none of its ids exist) resolved to the catalog.
+   * `shadowed` — a model id has the same name, so the exact match wins.
+   */
+  mode: AliasMode;
+  /** True when a non-empty config bucket resolved to nothing and fell back to the catalog. */
+  fallback: boolean;
+  /** Free candidate ids in routing order (ranker applied). Empty = unusable alias. */
+  candidates: string[];
+}
+
+/**
+ * Describe every configured alias for `GET /v1/models`, `airoute models` and
+ * `airoute status`. Pure: callers supply the catalog and, optionally, the same
+ * ranker routing uses so the listed order matches the failover order.
+ *
+ * Paid candidates are dropped: an alias never advertises a model the gateway
+ * would refuse with 403.
+ */
+export function describeAliases(
+  specs: readonly ModelSpec[],
+  aliasMap: AliasMap,
+  options: { rankCandidates?: ResolveOptions["rankCandidates"] } = {},
+): AliasDescription[] {
+  const descriptions: AliasDescription[] = [];
+  for (const alias of Object.keys(aliasMap)) {
+    const bucket = aliasMap[alias] ?? [];
+    if (specs.some((spec) => spec.id === alias)) {
+      descriptions.push({ alias, mode: "shadowed", fallback: false, candidates: [alias] });
+      continue;
+    }
+    const resolution = resolveCandidates(specs, alias, {
+      aliasMap,
+      // An empty bucket means "rank the catalog"; without a ranker the router
+      // has nothing to order, so use a neutral one to keep the description
+      // truthful for callers that only inspect the catalog (`airoute models`).
+      rankCandidates: options.rankCandidates ?? ((candidates) => candidates),
+    });
+    const candidates = resolution.candidates
+      .filter((spec) => spec.free === true)
+      .map((spec) => spec.id);
+    const explicitPresent = bucket.some((id) => specs.some((spec) => spec.id === id));
+    descriptions.push({
+      alias,
+      mode: explicitPresent ? "explicit" : "auto",
+      fallback: !explicitPresent && bucket.length > 0,
+      candidates,
+    });
+  }
+  return descriptions;
+}
+
 /**
  * Model name resolution against the registry. Fetches the (cached) aggregated
  * catalog, then applies `resolveModelFromSpecs`.

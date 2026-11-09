@@ -40,7 +40,7 @@ cd D:\tools\airoute
 git log --oneline -3      # expect ccce547 (phase3) at the tip, or newer
 git status --short        # should be clean
 npm run build             # tsc -b, must be clean
-npm test                  # vitest run — 256 tests / 23 files, all offline
+npm test                  # vitest run — 274 tests / 25 files, all offline
 ```
 
 If the test count is lower than expected, stop and find out what was reverted
@@ -79,7 +79,9 @@ Key module entry points:
 
 ```powershell
 npm start                     # gateway on http://127.0.0.1:8787 (uses .env if present)
-airoute status                # ranked free models + breaker state + uptime
+airoute models --json         # catalog + alias wiring (machine-readable)
+airoute status                # ranked free models + per-alias health
+airoute status --json         # same, for scripts/dashboards
 airoute install-opencode      # write/merge global OpenCode config
 airoute install-opencode --project .            # project-local ./opencode.json
 airoute install-opencode --url http://127.0.0.1:8787   # install from a gateway catalog
@@ -104,6 +106,10 @@ Providers exposed by the gateway: `zai/*`, `openrouter/*`, plus aliases
   signals, ranker, health-aware failover, `airoute status`, `/healthz` monitor block.
 - **Phase 3 (done, commit `ccce547`)** — `@airoute/opencode`, `install-opencode`,
   tool calling end-to-end, `/v1/models` aliases, gate harness.
+- **Phase 4 (done)** — alias UX: `/v1/models` `alias_details`, alias-aware
+  routing errors (`alias_unavailable`, `all_candidates_unavailable` with
+  per-candidate state/retry), alias tables in `models`/`status`, `--json` for
+  both. 274 tests; Phase 3 gates re-run green (live + harness).
 
 Phase 3 gates that were actually run green against real OpenCode:
 
@@ -130,18 +136,19 @@ airoute install-opencode --project $tmp --url http://127.0.0.1:8799
 - **Failover/degradation evidence** for the gate comes from the deterministic
   harness; live providers cannot be forced to 429 on demand.
 - **No auth on the gateway.** It binds `127.0.0.1`; it is not safe to expose.
-- **No remote/push configured.** `git remote -v` is empty as of this writing.
+- **Remote:** `origin` → `https://github.com/oddball07/airoute.git`, `main` tracks it.
+  Git identity is still `AIRoute Phase 0 <airoute@local>` unless changed.
 - Reasoning/cost reporting beyond `cost: {input:0, output:0}` is not implemented.
 
-## 7. Next up (Phase 4)
+## 7. Next up (Phase 5)
 
-Per the plan, Phase 4 is **alias UX polish** (making `free-best` etc. explain
-themselves in `status`/`models`, alias-aware errors and hints), plus a plugin
-fallback **only if** the config-based provider proves insufficient. Re-run the
-Phase 3 gates on live sources after any routing change.
+Phase 4 is done. Next is **Phase 5: Anthropic `/v1/messages` adapter** so Claude
+Code can use the same gateway (secondary CLI — keep OpenCode green first).
+Add it as a separate route translating Anthropic wire ⇄ IR, with tests, then
+run a manual Claude Code check in a scratch dir. The OpenCode plugin fallback
+remains unnecessary unless the config provider hits a wall.
 
-Phase 5 (Anthropic `/v1/messages` → Claude Code) is explicitly gated behind
-Phase 4 sign-off. Do not start it early.
+Re-run the Phase 3 gates (live + harness) after any routing change.
 
 ## 8. Environment gotchas (learned the hard way)
 
@@ -151,6 +158,11 @@ Phase 4 sign-off. Do not start it early.
   after every source change.
 - **`Start-Job` children die with the PowerShell invocation.** Start the gateway
   and run `opencode` in the *same* script, or use a detached process.
+- **PowerShell 5 `>` redirects write UTF-16**, which breaks `JSON.parse` /
+  `ConvertFrom-Json`. Capture JSON via `cmd /c "node … > file"` or
+  `fs.readFileSync(file, "utf8")`.
+- **`--json` keeps stdout clean**: info logs are routed to stderr, but any
+  process writing to stdout (custom `console.log`) would still corrupt it.
 - **Stale listeners** hold ports 8787/8799. Kill with
   `Get-NetTCPConnection -LocalPort <p> -State Listen` → `Stop-Process`.
 - **Temp dirs** used by gate runs: `%TEMP%\airoute-e2e` (real gateway) and

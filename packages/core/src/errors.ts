@@ -30,12 +30,14 @@ export class UpstreamError extends AirouteError {
   }
 }
 
-/** OpenAI-style error envelope type: `{ error: { message, type, code } }`. */
+/** OpenAI-style error envelope type: `{ error: { message, type, code, details? } }`. */
 export interface ErrorBody {
   error: {
     message: string;
     type: string;
     code: string | null;
+    /** Optional machine-readable context (available models, per-candidate health, ...). */
+    details?: Record<string, unknown>;
   };
 }
 
@@ -51,6 +53,13 @@ function statusToType(status: number): string {
 }
 
 /** Build the OpenAI error envelope for a status + message + code. */
-export function makeErrorBody(message: string, status: number, code: string | null = null): ErrorBody {
-  return { error: { message, type: statusToType(status), code } };
+export function makeErrorBody(
+  message: string,
+  status: number,
+  code: string | null = null,
+  details?: Record<string, unknown>,
+): ErrorBody {
+  const error: ErrorBody["error"] = { message, type: statusToType(status), code };
+  if (details !== undefined && Object.keys(details).length > 0) error.details = details;
+  return { error };
 }

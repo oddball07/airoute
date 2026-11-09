@@ -19,7 +19,6 @@ import {
   buildRegistry,
   createLogger,
   loadConfig,
-  resolveCandidates,
   type AirouteConfig,
   type Logger,
   type ModelSpec,
@@ -32,6 +31,7 @@ import { createOpenRouterSourceFactory } from "@airoute/openrouter";
 import { createZaiSourceFactory } from "@airoute/zai";
 import { RANK_WINDOW_MS, createRanker, metricsDbPath, startMonitor } from "./monitor-runtime.js";
 import { clientConnectableGatewayUrl } from "./gateway-url.js";
+import { buildAliasViews, formatAliasSection } from "./alias-view.js";
 
 /**
  * Type-name → factory wiring. `packages/sources/<name>` packages register
@@ -47,8 +47,8 @@ const USAGE = `airoute ${AIRROUTE_VERSION} — local gateway between CLI agents 
 
 Usage:
   airoute serve [--port N] [--host H] [--config PATH]   start the gateway
-  airoute models [--config PATH]                        list the free catalog
-  airoute status [--config PATH]                        rank free models by health
+  airoute models [--config PATH] [--json]               list the free catalog + aliases
+  airoute status [--config PATH] [--json]               rank free models by health
   airoute install-opencode [--project [DIR]] [--config PATH]
                             [--url URL] [--model NAME] [--dry-run]
                                                         write the OpenCode provider config
@@ -209,14 +209,44 @@ async function runServe(options: Map<string, string | boolean>): Promise<void> {
 }
 
 async function runModels(options: Map<string, string | boolean>): Promise<void> {
-  const logger = createLogger({ scope: "airoute" });
+  const json = options.get("json") === true;
+  // `--json` owns stdout; route info logs to stderr so the output stays parseable.
+  const logger = createLogger(json ? { scope: "airoute", out: process.stderr } : { scope: "airoute" });
   const { config, configPath } = await loadOrExit(options, logger);
 
   const build = await buildRegistry({ config, factories: SOURCE_FACTORIES, logger: logger.child("sources") });
   const specs = await build.registry.models();
+  // No health layer for `models`: it describes the catalog and alias wiring,
+  // not live ranking (that is `status`).
+  const aliases = buildAliasViews(specs, config.aliases);
+
+  if (json) {
+    console.log(
+      JSON.stringify(
+        {
+          config: configPath,
+          models: [...specs]
+            .sort((a, b) => a.id.localeCompare(b.id))
+            .map((spec) => ({
+              id: spec.id,
+              source: spec.sourceId,
+              context_window: spec.contextWindow,
+              caps: spec.caps,
+              free: spec.free,
+              aliases: spec.aliases,
+            })),
+          aliases,
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
 
   if (specs.length === 0) {
     console.log(`no models (config: ${configPath}; enable a source in your config)`);
+    for (const line of formatAliasSection(aliases, false)) console.log(line);
     return;
   }
   const sorted = [...specs].sort((a, b) => a.id.localeCompare(b.id));
@@ -240,23 +270,23 @@ async function runModels(options: Map<string, string | boolean>): Promise<void> 
         spec.aliases.join(", ").padEnd(aliasesWidth),
     );
   }
+  console.log();
+  for (const line of formatAliasSection(aliases, false)) console.log(line);
 }
 
 async function runStatus(options: Map<string, string | boolean>): Promise<void> {
-  const logger = createLogger({ scope: "airoute" });
+  const json = options.get("json") === true;
+  // `--json` owns stdout; route info logs to stderr so the output stays parseable.
+  const logger = createLogger(json ? { scope: "airoute", out: process.stderr } : { scope: "airoute" });
   const { config, configPath } = await loadOrExit(options, logger);
 
   const build = await buildRegistry({ config, factories: SOURCE_FACTORIES, logger: logger.child("sources") });
   const specs = await build.registry.models();
-  if (specs.length === 0) {
-    console.log(`no models (config: ${configPath}; enable a source in your config)`);
-    return;
-  }
 
   const dbPath = metricsDbPath();
   const store = existsSync(dbPath) ? new MetricsStore(dbPath) : undefined;
   try {
-    const health = store === undefined ? undefined : new HealthTracker({ store });
+    const health = store === undefined ? undefined : new HealthTracker({ store, logger: logger.child("health") });
     const ranker = createRanker(store, health, config.rank.weights);
     const ranked = rankModels(
       specs.map((spec): RankInput => {
@@ -270,6 +300,47 @@ async function runStatus(options: Map<string, string | boolean>): Promise<void> 
       }),
       config.rank.weights,
     );
+    const aliases = buildAliasViews(specs, config.aliases, ranker, health);
+
+    if (json) {
+      console.log(
+        JSON.stringify(
+          {
+            config: configPath,
+            metrics: {
+              path: dbPath,
+              window_hours: Math.round(RANK_WINDOW_MS / 3_600_000),
+              available: store !== undefined,
+            },
+            weights: config.rank.weights,
+            models: ranked.map((row) => {
+              const stats = store?.getStats(row.spec.sourceId, row.spec.id, RANK_WINDOW_MS) ?? null;
+              const rate = stats?.probeSuccessRate ?? stats?.requestSuccessRate ?? null;
+              return {
+                id: row.spec.id,
+                source: row.spec.sourceId,
+                score: Number(row.score.toFixed(4)),
+                state: health?.state(row.spec.sourceId, row.spec.id) ?? "healthy",
+                uptime: rate === null ? null : Number(rate.toFixed(4)),
+                p50_ms: stats?.p50Ms ?? null,
+                context_window: row.spec.contextWindow,
+                caps: row.spec.caps,
+              };
+            }),
+            aliases,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+
+    if (specs.length === 0) {
+      console.log(`no models (config: ${configPath}; enable a source in your config)`);
+      for (const line of formatAliasSection(aliases, health !== undefined)) console.log(line);
+      return;
+    }
 
     console.log(
       store === undefined
@@ -303,15 +374,8 @@ async function runStatus(options: Map<string, string | boolean>): Promise<void> 
       );
     }
 
-    console.log("\naliases:");
-    for (const alias of Object.keys(config.aliases)) {
-      const resolution = resolveCandidates(specs, alias, {
-        aliasMap: config.aliases,
-        rankCandidates: ranker,
-      });
-      const best = resolution.candidates.find((candidate) => candidate.free === true);
-      console.log(`  ${pad(alias, 12)}→ ${best?.id ?? "(no free candidate)"}`);
-    }
+    console.log();
+    for (const line of formatAliasSection(aliases, health !== undefined)) console.log(line);
   } finally {
     store?.close();
   }
